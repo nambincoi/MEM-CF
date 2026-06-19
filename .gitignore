@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments
+.venv/
+.env
+.env.local
+
+# Runtime data and outputs
+data/*
+!data/README.md
+agent_memory/*
+!agent_memory/README.md
+evaluation_results/*
+!evaluation_results/README.md
+
+# Logs and checkpoints
+*.log
+*.pid
+*.pth
+*.pt
+*.ckpt
+checkpoints/
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
