@@ -6,9 +6,12 @@ DATASET="${1:?Usage: run_ablation_one_dataset.sh <dataset> <variant>}"
 VARIANT="${2:?Usage: run_ablation_one_dataset.sh <dataset> <variant>}"
 
 export PYTHONPATH="$ROOT/src:${PYTHONPATH:-}"
-export MEMCF_DATA_ROOT="${MEMCF_DATA_ROOT:-$ROOT/data}"
-export MEMCF_EVAL_ROOT="${MEMCF_EVAL_ROOT:-$ROOT/evaluation_results}"
-export MEMCF_MEMORY_ROOT="${MEMCF_MEMORY_ROOT:-$ROOT/agent_memory}"
+export MEMCF_DATA_ROOT="${MEMCF_DATA_ROOT:-${AGENTICREC_DATA_ROOT:-$ROOT/data}}"
+export MEMCF_EVAL_ROOT="${MEMCF_EVAL_ROOT:-${AGENTICREC_EVAL_ROOT:-$ROOT/evaluation_results}}"
+export MEMCF_MEMORY_ROOT="${MEMCF_MEMORY_ROOT:-${AGENTICREC_MEMORY_ROOT:-$ROOT/agent_memory}}"
+export AGENTICREC_DATA_ROOT="$MEMCF_DATA_ROOT"
+export AGENTICREC_EVAL_ROOT="$MEMCF_EVAL_ROOT"
+export AGENTICREC_MEMORY_ROOT="$MEMCF_MEMORY_ROOT"
 export chat_api_base="${chat_api_base:-http://127.0.0.1:8000/v1}"
 export api_base="${api_base:-$chat_api_base}"
 export chat_model_name="${chat_model_name:-gpt-3.5-turbo-16k-0613}"
@@ -20,6 +23,7 @@ MAX_NEG="${MAX_NEGATIVE_CANDIDATES:-19}"
 MAX_ITER="${MAX_ITERATIONS:-1}"
 NEIGHBOR_K="${NEIGHBOR_K:-10}"
 MIN_EVIDENCE="${MIN_EVIDENCE_TERMS:-1}"
+RANKING_PROMPT_STYLE="${RANKING_PROMPT_STYLE:-compact_score}"
 
 mkdir -p "$MEMCF_EVAL_ROOT/$DATASET/logs"
 LOG="$MEMCF_EVAL_ROOT/$DATASET/logs/${VARIANT}_nuser${N_USERS}.log"
@@ -32,6 +36,7 @@ case "$VARIANT" in
       --no_use_memory
       --max_positive_interactions "$MAX_POS"
       --max_negative_candidates "$MAX_NEG"
+      --ranking_prompt_style "$RANKING_PROMPT_STYLE"
     )
     ;;
   A1_safe_graph_no_noharm)
@@ -42,6 +47,7 @@ case "$VARIANT" in
       --max_iterations "$MAX_ITER"
       --max_positive_interactions "$MAX_POS"
       --max_negative_candidates "$MAX_NEG"
+      --ranking_prompt_style "$RANKING_PROMPT_STYLE"
       --graph_memory_k 3
       --neighbor_k "$NEIGHBOR_K"
       --min_evidence_terms "$MIN_EVIDENCE"
@@ -55,6 +61,7 @@ case "$VARIANT" in
       --max_iterations "$MAX_ITER"
       --max_positive_interactions "$MAX_POS"
       --max_negative_candidates "$MAX_NEG"
+      --ranking_prompt_style "$RANKING_PROMPT_STYLE"
       --graph_memory_k 3
       --neighbor_k "$NEIGHBOR_K"
       --min_evidence_terms "$MIN_EVIDENCE"
@@ -69,6 +76,7 @@ case "$VARIANT" in
       --max_iterations "$MAX_ITER"
       --max_positive_interactions "$MAX_POS"
       --max_negative_candidates "$MAX_NEG"
+      --ranking_prompt_style "$RANKING_PROMPT_STYLE"
       --graph_memory_k 5
       --neighbor_k "$NEIGHBOR_K"
       --min_evidence_terms "$MIN_EVIDENCE"

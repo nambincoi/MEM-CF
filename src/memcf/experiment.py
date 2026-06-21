@@ -230,13 +230,25 @@ def deterministic_shuffle(values: List[Any], salt: str = "") -> List[Any]:
     return values
 
 
+def dedupe_preserve_order(values: List[Any]) -> List[str]:
+    seen = set()
+    deduped: List[str] = []
+    for value in values:
+        key = str(value)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(key)
+    return deduped
+
+
 def make_jsonable(obj: Any) -> Any:
     """Convert dataclasses/numpy values into JSON-safe objects for traces."""
     if isinstance(obj, np.ndarray):
         return obj.tolist()
     if isinstance(obj, np.generic):
         return obj.item()
-    if isinstance(obj, (UserInteraction, BehaviorMemory, MEMCFUserState, MEMCFItemState)):
+    if isinstance(obj, (UserInteraction, BehaviorMemory, PairwiseUserState, PairwiseItemState)):
         return asdict(obj)
     if isinstance(obj, dict):
         return {str(k): make_jsonable(v) for k, v in obj.items()}
@@ -333,6 +345,30 @@ def normalize_category(category: Any, fallback: str = "Unknown") -> str:
     raw = re.sub(r"<[^>]+>", " ", raw)
     raw = re.sub(r"\s+", " ", raw).strip(" /|>")
     return raw or fallback
+
+
+def memory_text_is_too_generic(text: str, min_terms: int = 4) -> bool:
+    return len(set(normalize_terms(text))) < min_terms
+
+
+def collect_runtime_negative_pool(
+    negative_data: Optional[Dict[str, Any]],
+    valid_item_ids: Optional[Set[str]] = None,
+    exclude_ids: Optional[Set[str]] = None,
+) -> List[str]:
+    negative_data = negative_data or {}
+    values: List[str] = []
+    for key in ("val_neg", "test_neg", "train_neg", "negatives"):
+        raw = negative_data.get(key, [])
+        if isinstance(raw, list):
+            values.extend(str(x) for x in raw)
+    values = dedupe_preserve_order(values)
+    exclude_ids = set(str(x) for x in (exclude_ids or set()))
+    if valid_item_ids is not None:
+        values = [x for x in values if x in valid_item_ids and x not in exclude_ids]
+    else:
+        values = [x for x in values if x not in exclude_ids]
+    return values
 
 
 def item_category(item_info: Dict[str, Any], fallback: str = "Unknown") -> str:
@@ -685,8 +721,8 @@ class BehaviorMemory:
 
 
 @dataclass
-class MEMCFUserState:
-    """MEMCF pairwise user state used to bootstrap fail-interaction memory generation."""
+class PairwiseUserState:
+    """pairwise user state used to bootstrap fail-interaction memory generation."""
     user_id: str
     short_term_memory: str = "I enjoy discovering new items."
     long_term_memory: List[str] = field(default_factory=list)
@@ -701,8 +737,8 @@ class MEMCFUserState:
 
 
 @dataclass
-class MEMCFItemState:
-    """MEMCF pairwise item state with mutable textual memory."""
+class PairwiseItemState:
+    """pairwise item state with mutable textual memory."""
     item_id: str
     title: str
     category: str
@@ -1377,6 +1413,7 @@ class RecommendationMemorySystem:
                    candidate_items: List[Dict],
                    retrieved_memories: Optional[List[BehaviorMemory]],
                    prompt_sample: str,
+                   ranking_prompt_style: str = "memcf",
                    trace_context: Optional[Dict[str, Any]] = None) -> List[str]:
         """Score candidates with the LLM, then sort locally.
 
@@ -1412,7 +1449,15 @@ class RecommendationMemorySystem:
                     "keywords": getattr(mem, "keywords", [])[:10],
                 })
 
-        if retrieved_memories:
+        if ranking_prompt_style == "compact_score":
+            prompt = build_compact_score_prompt(
+                history_items=user_profile[-10:],
+                aliased_candidates=aliased_candidates,
+                prompt_sample=prompt_sample,
+                memory_payload=memory_thoughts if retrieved_memories else None,
+                user_profile_payload=None,
+            )
+        elif retrieved_memories:
             prompt = f"""
 You are scoring candidate items for a recommender system.
 
@@ -1492,11 +1537,13 @@ JSON format:
                     "minItems": len(valid_candidate_aliases),
                     "maxItems": len(valid_candidate_aliases),
                 },
-                "reasoning": {"type": "string"},
             },
-            "required": ["scores", "reasoning"],
+            "required": ["scores"],
             "additionalProperties": False,
         }
+        if ranking_prompt_style != "compact_score":
+            score_json_schema["properties"]["reasoning"] = {"type": "string"}
+            score_json_schema["required"] = ["scores", "reasoning"]
 
         max_retries = int(os.getenv("MEMCF_RANK_RETRIES", "1"))
         current_prompt = prompt
@@ -1924,14 +1971,14 @@ def calculate_ndcg_at_k(predictions: List[str], ground_truth: List[str], k: int)
     return dcg / idcg if idcg > 0 else 0.0
 
 
-def init_memcf_item_states(items_meta: Dict[str, Dict[str, Any]]) -> Dict[str, MEMCFItemState]:
-    """Initialize item states exactly like MEMCF item-state initialization."""
-    item_states: Dict[str, MEMCFItemState] = {}
+def init_pairwise_item_states(items_meta: Dict[str, Dict[str, Any]]) -> Dict[str, PairwiseItemState]:
+    """Initialize item states for pairwise failure training."""
+    item_states: Dict[str, PairwiseItemState] = {}
     for item_id, item_info in items_meta.items():
         title = item_title(item_info, str(item_id))
         category = item_category(item_info)
         memory = f"The item is called '{title}'. The category is: '{category}'."
-        item_states[item_id] = MEMCFItemState(
+        item_states[item_id] = PairwiseItemState(
             item_id=item_id,
             title=title,
             category=category,
@@ -1940,9 +1987,9 @@ def init_memcf_item_states(items_meta: Dict[str, Dict[str, Any]]) -> Dict[str, M
     return item_states
 
 
-def get_or_create_user_state(user_states: Dict[str, MEMCFUserState], user_id: str) -> MEMCFUserState:
+def get_or_create_user_state(user_states: Dict[str, PairwiseUserState], user_id: str) -> PairwiseUserState:
     if user_id not in user_states:
-        user_states[user_id] = MEMCFUserState(user_id=user_id)
+        user_states[user_id] = PairwiseUserState(user_id=user_id)
     return user_states[user_id]
 
 
@@ -1963,13 +2010,13 @@ def _extract_json_from_llm_output(raw_output: str) -> Dict[str, Any]:
         return json.loads(json_str)
 
 
-def autonomous_pairwise_choice(
+def autonomous_pairwise_interaction(
     memory_system: RecommendationMemorySystem,
-    user_state: MEMCFUserState,
-    pos_item: MEMCFItemState,
-    neg_item: MEMCFItemState,
+    user_state: PairwiseUserState,
+    pos_item: PairwiseItemState,
+    neg_item: PairwiseItemState,
 ) -> Tuple[str, str]:
-    """MEMCF pairwise autonomous interaction: choose between positive/negative item."""
+    """pairwise autonomous interaction: choose between positive/negative item."""
     prompt = f"""You are an enthusiast. Here is your self-introduction: "{user_state.short_term_memory}"
 
 Now, you are considering to select an item from two candidates:
@@ -2004,15 +2051,15 @@ Important: You must choose one of these two candidates."""
     return chosen_item_id, response
 
 
-def collaborative_failure_reflection(
+def corrective_pairwise_reflection(
     memory_system: RecommendationMemorySystem,
-    user_state: MEMCFUserState,
-    pos_item: MEMCFItemState,
-    neg_item: MEMCFItemState,
+    user_state: PairwiseUserState,
+    pos_item: PairwiseItemState,
+    neg_item: PairwiseItemState,
     chosen_item_id: str,
     explanation: str,
 ) -> None:
-    """MEMCF pairwise reflection update for user memory and item memories."""
+    """pairwise reflection update for user memory and item memories."""
     if chosen_item_id == pos_item.item_id:
         return
 
@@ -2125,14 +2172,20 @@ def train_memory_from_fail_interactions(
     user_id: str,
     user_data: Dict,
     memory_system: RecommendationMemorySystem,
-    user_states: Dict[str, MEMCFUserState],
-    item_states: Dict[str, MEMCFItemState],
+    user_states: Dict[str, PairwiseUserState],
+    item_states: Dict[str, PairwiseItemState],
+    items_meta: Dict[str, Dict[str, Any]],
+    negative_data: Optional[Dict[str, Any]] = None,
     max_iterations: int = 1,
     max_positive_interactions: Optional[int] = None,
+    candidate_negative_mode: str = "random",
+    min_lesson_confidence: float = 0.25,
+    max_lesson_risk: float = 0.85,
+    max_failure_lessons_per_user: int = 3,
 ) -> List[BehaviorMemory]:
     """
     Hybrid training:
-    - MEMCF pairwise initialization and interaction loop.
+    - pairwise initialization and interaction loop.
     - Create behavior memories ONLY from failed interactions.
     """
     train_items = user_data["train"]
@@ -2158,16 +2211,24 @@ def train_memory_from_fail_interactions(
         if pos_item_id not in item_states:
             continue
 
-        neg_candidates = [iid for iid in all_item_ids if iid != pos_item_id]
-        if not neg_candidates:
+        neg_item_id = choose_training_negative_item_id(
+            user_id=str(user_id),
+            pos_item_id=str(pos_item_id),
+            user_data=user_data,
+            negative_data=negative_data,
+            items_meta=items_meta,
+            all_item_ids=all_item_ids,
+            mode=candidate_negative_mode,
+            max_positive_interactions=max_positive_interactions,
+        )
+        if not neg_item_id:
             continue
-        neg_item_id = random.choice(neg_candidates)
 
         pos_item = item_states[pos_item_id]
         neg_item = item_states[neg_item_id]
 
         for _ in range(max_iterations):
-            chosen_item_id, explanation = autonomous_pairwise_choice(
+            chosen_item_id, explanation = autonomous_pairwise_interaction(
                 memory_system=memory_system,
                 user_state=user_state,
                 pos_item=pos_item,
@@ -2179,7 +2240,7 @@ def train_memory_from_fail_interactions(
                 break
 
             try:
-                collaborative_failure_reflection(
+                corrective_pairwise_reflection(
                     memory_system=memory_system,
                     user_state=user_state,
                     pos_item=pos_item,
@@ -2210,6 +2271,24 @@ def train_memory_from_fail_interactions(
             ]
             try:
                 fail_memory = memory_system.create_behavior_thought(fail_window)
+                passed_gate, gate_reason = behavior_memory_passes_quality_gate(
+                    fail_memory,
+                    fail_window,
+                    min_confidence=min_lesson_confidence,
+                    max_risk=max_lesson_risk,
+                )
+                memory_system._trace("memory_quality_gate", {
+                    "user_id": user_id,
+                    "positive_item_id": pos_item.item_id,
+                    "negative_item_id": neg_item.item_id,
+                    "passed": passed_gate,
+                    "reason": gate_reason,
+                    "min_lesson_confidence": min_lesson_confidence,
+                    "max_lesson_risk": max_lesson_risk,
+                    "memory": behavior_memory_to_trace(fail_memory),
+                })
+                if not passed_gate:
+                    continue
                 memory_system._trace("fail_memory_from_wrong_choice", {
                     "user_id": user_id,
                     "positive_item_id": pos_item.item_id,
@@ -2220,6 +2299,13 @@ def train_memory_from_fail_interactions(
                     "choice_explanation": explanation,
                 })
                 new_memories.append(fail_memory)
+                if max_failure_lessons_per_user > 0 and len(new_memories) >= max_failure_lessons_per_user:
+                    memory_system._trace("memory_generation_limit_reached", {
+                        "user_id": user_id,
+                        "max_failure_lessons_per_user": max_failure_lessons_per_user,
+                        "current_count": len(new_memories),
+                    })
+                    return new_memories
             except Exception as e:
                 print(f"  ⚠ Fail-memory creation error for user {user_id}: {e}")
                 memory_system._trace("fail_memory_error", {
@@ -2242,7 +2328,8 @@ def evaluate_user(user_data: Dict,
                  memory_gate: str = "none",
                  memory_similarity_threshold: float = 0.35,
                  no_harm_arbitration: bool = False,
-                 no_harm_min_applicability: float = 1.0) -> Dict[str, float]:
+                 no_harm_min_applicability: float = 1.0,
+                 ranking_prompt_style: str = "memcf") -> Dict[str, float]:
     """Evaluate for a single user with LLM-based ranking"""
     
     # Get ground truth and candidates
@@ -2414,6 +2501,7 @@ def evaluate_user(user_data: Dict,
             candidate_items_info,
             None,
             prompt_sample,
+            ranking_prompt_style=ranking_prompt_style,
             trace_context={
                 "user_id": user_id,
                 "eval_type": eval_type,
@@ -2433,6 +2521,7 @@ def evaluate_user(user_data: Dict,
                 candidate_items_info,
                 retrieved_memories,
                 prompt_sample,
+                ranking_prompt_style=ranking_prompt_style,
                 trace_context={
                     "user_id": user_id,
                     "eval_type": eval_type,
@@ -2502,6 +2591,7 @@ def evaluate_user(user_data: Dict,
             candidate_items_info,
             retrieved_memories,
             prompt_sample,
+            ranking_prompt_style=ranking_prompt_style,
             trace_context={
                 "user_id": user_id,
                 "eval_type": eval_type,
@@ -2544,6 +2634,7 @@ def evaluate_user(user_data: Dict,
         "memory_retrieval_mode": memory_retrieval_mode,
         "memory_gate": memory_gate,
         "memory_similarity_threshold": memory_similarity_threshold,
+        "ranking_prompt_style": ranking_prompt_style,
         "no_harm_arbitration": arbitration_decision,
         "selected_ranking_source": selected_ranking_source,
         "retrieval_query_text": retrieval_query_text,
@@ -2601,6 +2692,18 @@ def parse_args():
                         help="If >0, use only the latest N positive train interactions per user.")
     parser.add_argument("--max_negative_candidates", type=int, default=0,
                         help="If >0, use only the first N negative candidates per user during evaluation.")
+    parser.add_argument("--candidate_negative_mode", type=str, default="candidate_hard",
+                        choices=["random", "candidate_hard"],
+                        help="Training negative sampling: random global item or user-runtime hard negative.")
+    parser.add_argument("--min_lesson_confidence", type=float, default=0.25,
+                        help="Minimum confidence/specificity required to keep a new fail lesson.")
+    parser.add_argument("--max_lesson_risk", type=float, default=0.85,
+                        help="Maximum overgeneralization risk allowed for a new fail lesson.")
+    parser.add_argument("--max_failure_lessons_per_user", type=int, default=3,
+                        help="Maximum kept failure lessons per user during training. <=0 means no cap.")
+    parser.add_argument("--ranking_prompt_style", type=str, default="compact_score",
+                        choices=["memcf", "compact_score"],
+                        help="Prompt style for ranking.")
     parser.add_argument("--trace_dir", type=str, default=None,
                         help="Directory for JSONL traces. Default: evaluation_results/<dataset>/traces/<run_name>.")
     parser.add_argument("--disable_trace", action="store_false", dest="trace_enabled",
@@ -2635,12 +2738,33 @@ def main():
     number_of_users = args.number_of_users
     max_positive_interactions = args.max_positive_interactions
     max_negative_candidates = args.max_negative_candidates
+    candidate_negative_mode = args.candidate_negative_mode
+    min_lesson_confidence = args.min_lesson_confidence
+    max_lesson_risk = args.max_lesson_risk
+    max_failure_lessons_per_user = args.max_failure_lessons_per_user
+    ranking_prompt_style = args.ranking_prompt_style
     trace_enabled = args.trace_enabled
 
-    base_dir = os.getenv("MEMCF_ROOT") or os.path.dirname(os.path.abspath(__file__))
-    data_root = os.getenv("MEMCF_DATA_ROOT") or os.path.join(base_dir, "data")
-    eval_root = os.getenv("MEMCF_EVAL_ROOT") or os.path.join(base_dir, "evaluation_results")
-    memory_root = os.getenv("MEMCF_MEMORY_ROOT") or os.path.join(base_dir, "agent_memory")
+    base_dir = (
+        os.getenv("MEMCF_ROOT")
+        or os.getenv("AGENTICREC_CFMEMORY_ROOT")
+        or os.path.dirname(os.path.abspath(__file__))
+    )
+    data_root = (
+        os.getenv("MEMCF_DATA_ROOT")
+        or os.getenv("AGENTICREC_DATA_ROOT")
+        or os.path.join(base_dir, "data")
+    )
+    eval_root = (
+        os.getenv("MEMCF_EVAL_ROOT")
+        or os.getenv("AGENTICREC_EVAL_ROOT")
+        or os.path.join(base_dir, "evaluation_results")
+    )
+    memory_root = (
+        os.getenv("MEMCF_MEMORY_ROOT")
+        or os.getenv("AGENTICREC_MEMORY_ROOT")
+        or os.path.join(base_dir, "agent_memory")
+    )
 
     items_path = os.path.join(data_root, data_name, "items.json")
     sequences_path = os.path.join(data_root, data_name, "user_sequences_10.json")
@@ -2700,6 +2824,11 @@ def main():
         "no_harm_min_applicability": no_harm_min_applicability,
         "max_positive_interactions": max_positive_interactions,
         "max_negative_candidates": max_negative_candidates,
+        "candidate_negative_mode": candidate_negative_mode,
+        "min_lesson_confidence": min_lesson_confidence,
+        "max_lesson_risk": max_lesson_risk,
+        "max_failure_lessons_per_user": max_failure_lessons_per_user,
+        "ranking_prompt_style": ranking_prompt_style,
         "phase": "phase1_correctness",
     })
     if trace_enabled:
@@ -2718,8 +2847,8 @@ def main():
     
     global_memory = RecommendationMemorySystem(use_gemini_embeddings=True)
     global_memory.trace_recorder = trace_recorder
-    user_states: Dict[str, MEMCFUserState] = {}
-    item_states = init_memcf_item_states(items_meta)
+    user_states: Dict[str, PairwiseUserState] = {}
+    item_states = init_pairwise_item_states(items_meta)
 
     if use_memory:
         if LOAD_SAVED_MEMORY and os.path.exists(memory_file_path):
@@ -2734,6 +2863,22 @@ def main():
             
             global_memory = RecommendationMemorySystem(use_gemini_embeddings=False)
             global_memory.trace_recorder = trace_recorder
+            for user_id in user_ids:
+                profile = initialize_user_memory_from_history_v2(
+                    memory_system=global_memory,
+                    user_id=str(user_id),
+                    user_data=user_sequences[user_id],
+                    items_meta=items_meta,
+                    max_positive_interactions=max_positive_interactions,
+                )
+                user_states[str(user_id)] = PairwiseUserState(
+                    user_id=str(user_id),
+                    short_term_memory=profile.profile,
+                )
+                global_memory._trace("user_memory_initialized", {
+                    "user_id": user_id,
+                    "profile": asdict(profile),
+                })
             
             # shuffled_user_ids = user_ids.copy()
             # random.shuffle(shuffled_user_ids)
@@ -2777,8 +2922,14 @@ def main():
                         memory_system=temp_system,
                         user_states=user_states,
                         item_states=item_states,
+                        items_meta=items_meta,
+                        negative_data=user_negatives.get(user_id, {}),
                         max_iterations=max_iterations,
                         max_positive_interactions=max_positive_interactions,
+                        candidate_negative_mode=candidate_negative_mode,
+                        min_lesson_confidence=min_lesson_confidence,
+                        max_lesson_risk=max_lesson_risk,
+                        max_failure_lessons_per_user=max_failure_lessons_per_user,
                     )
                 except Exception as e:
                     print(f"\nError evaluating user {user_id}: {e}")
@@ -2893,6 +3044,7 @@ def main():
                 memory_similarity_threshold=memory_similarity_threshold,
                 no_harm_arbitration=no_harm_arbitration,
                 no_harm_min_applicability=no_harm_min_applicability,
+                ranking_prompt_style=ranking_prompt_style,
             )
             # Lưu tạm thông tin user này
             all_user_results.append({
@@ -2973,7 +3125,7 @@ def main():
     }
 
     summary = {
-        "model": "MEMCF_LEGACY",
+        "model": "MEMCF",
         "dataset": data_name,
         "number_of_users_requested": number_of_users,
         "number_of_users_evaluated": len(all_user_results),
@@ -2992,6 +3144,11 @@ def main():
         "trace_dir": trace_dir if trace_enabled else None,
         "max_positive_interactions": max_positive_interactions,
         "max_negative_candidates": max_negative_candidates,
+        "candidate_negative_mode": candidate_negative_mode,
+        "min_lesson_confidence": min_lesson_confidence,
+        "max_lesson_risk": max_lesson_risk,
+        "max_failure_lessons_per_user": max_failure_lessons_per_user,
+        "ranking_prompt_style": ranking_prompt_style,
         "phase1_correctness": {
             "clean_ranked_item_ids": True,
             "drop_hallucinated_item_ids": True,
@@ -3024,7 +3181,7 @@ def main():
     summary_file = output_file.replace(".json", ".summary.json")
     with open(summary_file, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
-    print(f"✓ Saved MEMCF_LEGACY summary to {summary_file}")
+    print(f"✓ Saved MEMCF summary to {summary_file}")
     trace_recorder.write_manifest({
         "run_name": run_name,
         "output_file": output_file,
@@ -3057,7 +3214,7 @@ class UserMemoryProfile:
 
 @dataclass
 class FailureEvent:
-    """Full trace object for one failed MEMCF pairwise interaction."""
+    """Full trace object for one failed pairwise interaction."""
     event_id: str
     source_user_id: str
     recent_history: List[Dict[str, Any]]
@@ -3156,8 +3313,69 @@ def _context_text_from_items(items: List[Dict[str, Any]]) -> str:
     return " ".join(f"{x.get('title', '')} {x.get('category', '')}" for x in items).lower()
 
 
+def _item_tokens_for_hard_negative(item_id: str, items_meta: Dict[str, Dict[str, Any]]) -> Set[str]:
+    info = _item_info_for_prompt(str(item_id), items_meta)
+    text = f"{info.get('title', '')} {info.get('category', '')}"
+    return set(normalize_terms(text))
+
+
+def choose_training_negative_item_id(
+    user_id: str,
+    pos_item_id: str,
+    user_data: Dict[str, Any],
+    negative_data: Optional[Dict[str, Any]],
+    items_meta: Dict[str, Dict[str, Any]],
+    all_item_ids: List[str],
+    mode: str = "random",
+    max_positive_interactions: Optional[int] = None,
+) -> Optional[str]:
+    valid_item_ids = set(str(x) for x in all_item_ids)
+    pos_item_id = str(pos_item_id)
+    runtime_pool = collect_runtime_negative_pool(
+        negative_data=negative_data,
+        valid_item_ids=valid_item_ids,
+        exclude_ids={pos_item_id},
+    )
+    if mode != "candidate_hard":
+        base_pool = runtime_pool or [str(iid) for iid in all_item_ids if str(iid) != pos_item_id]
+        if not base_pool:
+            return None
+        return deterministic_shuffle(base_pool, salt=f"randneg::{user_id}::{pos_item_id}")[0]
+
+    if not runtime_pool:
+        fallback_pool = [str(iid) for iid in all_item_ids if str(iid) != pos_item_id]
+        if not fallback_pool:
+            return None
+        return deterministic_shuffle(fallback_pool, salt=f"hardneg_fallback::{user_id}::{pos_item_id}")[0]
+
+    history_ids = [str(x) for x in user_data.get("train", [])]
+    if max_positive_interactions and max_positive_interactions > 0:
+        history_ids = history_ids[-max_positive_interactions:]
+    else:
+        history_ids = history_ids[-10:]
+    anchor_tokens: Set[str] = set()
+    for hid in history_ids:
+        anchor_tokens.update(_item_tokens_for_hard_negative(hid, items_meta))
+    anchor_tokens.update(_item_tokens_for_hard_negative(pos_item_id, items_meta))
+
+    pos_category = _item_info_for_prompt(pos_item_id, items_meta).get("category", "Unknown")
+    shuffled_pool = deterministic_shuffle(runtime_pool, salt=f"hardneg_pool::{user_id}::{pos_item_id}")
+    best_item_id = shuffled_pool[0]
+    best_score = -1.0
+    for neg_item_id in shuffled_pool:
+        neg_tokens = _item_tokens_for_hard_negative(neg_item_id, items_meta)
+        neg_category = _item_info_for_prompt(neg_item_id, items_meta).get("category", "Unknown")
+        overlap = len(anchor_tokens & neg_tokens)
+        category_bonus = 0.5 if pos_category != "Unknown" and pos_category == neg_category else 0.0
+        score = float(overlap) + category_bonus
+        if score > best_score:
+            best_score = score
+            best_item_id = neg_item_id
+    return best_item_id
+
+
 class MemoryGraphIndex:
-    """Graph-scoped memory index for retrieving fail lessons.
+    """Graph-scoped for retrieving fail lessons.
 
     Nodes:
     - users
@@ -3289,6 +3507,152 @@ class MemoryGraphIndex:
         return graph
 
 
+def behavior_memory_passes_quality_gate(
+    memory: "BehaviorMemory",
+    interaction_window: List["UserInteraction"],
+    min_confidence: float,
+    max_risk: float,
+) -> Tuple[bool, str]:
+    specificity = _safe_float(getattr(memory, "specificity_score", 0.0), 0.0)
+    risk = _safe_float(getattr(memory, "overgeneralization_risk", 1.0), 1.0)
+    wrong_ids = [
+        str(x.item_id) for x in interaction_window
+        if str((x.metadata or {}).get("role", "")) in {"chosen_wrong", "wrong_choice"}
+    ]
+    correct_ids = [
+        str(x.item_id) for x in interaction_window
+        if str((x.metadata or {}).get("role", "")) in {"ground_truth", "preferred_item"}
+    ]
+    concrete_terms = normalize_evidence_terms(
+        list(getattr(memory, "evidence_terms_required", []) or [])
+        + list(getattr(memory, "keywords", []) or [])
+        + [getattr(memory, "wrong_item_type", ""), getattr(memory, "correct_item_type", "")]
+    )
+    combined_text = " ".join([
+        str(getattr(memory, "behavior_explanation", "")),
+        str(getattr(memory, "pattern_description", "")),
+        str(getattr(memory, "wrong_item_type", "")),
+        str(getattr(memory, "correct_item_type", "")),
+        " ".join(concrete_terms[:8]),
+    ])
+    if specificity < min_confidence:
+        return False, f"low_specificity:{specificity:.2f}"
+    if risk > max_risk:
+        return False, f"high_risk:{risk:.2f}"
+    if not wrong_ids or not correct_ids:
+        return False, "missing_wrong_or_correct_item_ids"
+    if len(concrete_terms) < 2:
+        return False, "too_few_concrete_terms"
+    if memory_text_is_too_generic(combined_text):
+        return False, "memory_text_too_generic"
+    return True, "accepted"
+
+
+def failure_lesson_passes_quality_gate_v2(
+    lesson: "FailureLesson",
+    min_confidence: float,
+    max_risk: float,
+) -> Tuple[bool, str]:
+    confidence = _safe_float(getattr(lesson, "confidence", 0.0), 0.0)
+    risk = _safe_float(getattr(lesson, "overgeneralization_risk", 1.0), 1.0)
+    concrete_terms = normalize_evidence_terms(
+        list(getattr(lesson, "evidence_terms", []) or [])
+        + list(getattr(lesson, "applies_if", []) or [])
+        + [getattr(lesson, "prefer", ""), getattr(lesson, "avoid", "")]
+    )
+    combined_text = " ".join([
+        str(getattr(lesson, "lesson", "")),
+        str(getattr(lesson, "prefer", "")),
+        str(getattr(lesson, "avoid", "")),
+        " ".join(concrete_terms[:8]),
+    ])
+    if confidence < min_confidence:
+        return False, f"low_confidence:{confidence:.2f}"
+    if risk > max_risk:
+        return False, f"high_risk:{risk:.2f}"
+    if not getattr(lesson, "wrong_item_id", "") or not getattr(lesson, "correct_item_id", ""):
+        return False, "missing_wrong_or_correct_item_ids"
+    if len(concrete_terms) < 2:
+        return False, "too_few_concrete_terms"
+    if memory_text_is_too_generic(combined_text):
+        return False, "lesson_text_too_generic"
+    return True, "accepted"
+
+
+def _format_compact_history_lines(items: List[Dict[str, Any]]) -> str:
+    if not items:
+        return "- No user history."
+    return "\n".join(
+        f"- title: {str(item.get('title', '')).strip() or 'Unknown'}; category: {str(item.get('category', 'Unknown')).strip() or 'Unknown'}"
+        for item in items[-10:]
+    )
+
+
+def _format_compact_candidate_lines(items: List[Dict[str, Any]]) -> str:
+    return "\n".join(
+        f"- candidate_id: {item.get('candidate_id')}, title: {str(item.get('title', '')).strip() or 'Unknown'}, category: {str(item.get('category', 'Unknown')).strip() or 'Unknown'}"
+        for item in items
+    )
+
+
+def build_compact_score_prompt(
+    history_items: List[Dict[str, Any]],
+    aliased_candidates: List[Dict[str, Any]],
+    prompt_sample: str = "",
+    memory_payload: Optional[List[Any]] = None,
+    user_profile_payload: Optional[Dict[str, Any]] = None,
+) -> str:
+    using_memory = bool(memory_payload)
+    intro = (
+        "You are scoring candidate items for a recommender system based on user history, candidate facts, and optional memory facts.\n"
+        if using_memory else
+        "You are scoring candidate items for a recommender system based only on user history and candidate facts.\n"
+    )
+    parts = [intro]
+    if prompt_sample:
+        parts.append(str(prompt_sample).strip() + "\n")
+    parts.append("Inputs:\n")
+    if user_profile_payload:
+        parts.append("User Memory Profile:\n")
+        parts.append(json.dumps(user_profile_payload, ensure_ascii=False, indent=2) + "\n")
+    parts.append("User recent history:\n")
+    parts.append(_format_compact_history_lines(history_items) + "\n")
+    if memory_payload:
+        parts.append("Memory Facts:\n")
+        for row in memory_payload[:5]:
+            if isinstance(row, dict):
+                text = (
+                    row.get("lesson")
+                    or row.get("behavior_explanation")
+                    or row.get("pattern")
+                    or row.get("pattern_description")
+                    or json.dumps(row, ensure_ascii=False)
+                )
+            else:
+                text = str(row)
+            cleaned_text = re.sub(r"\s+", " ", str(text)).strip()[:220]
+            parts.append(f"- {cleaned_text}\n")
+    parts.append("Candidate Items:\n")
+    parts.append(_format_compact_candidate_lines(aliased_candidates) + "\n")
+    parts.append(
+        "\nOutput requirements:\n"
+        "- Return ONLY valid compact JSON. No markdown.\n"
+        "- Output one score row for every candidate_id exactly once.\n"
+        "- Score is a number from 0.0 to 1.0.\n"
+        "- Rationale must be <= 8 words.\n"
+        "- Base scoring on recent history and candidate facts.\n"
+        "- If history is weak, prefer broader category relevance.\n"
+        "\nJSON format:\n"
+        "{\n"
+        '  "scores": [\n'
+        '    {"candidate_id": "C01", "score": 0.0, "rationale": "short reason"}\n'
+        "  ],\n"
+        '  "reasoning": "one short sentence"\n'
+        "}\n"
+    )
+    return "".join(parts)
+
+
 def initialize_user_memory_from_history_v2(
     memory_system: RecommendationMemorySystem,
     user_id: str,
@@ -3388,8 +3752,8 @@ def make_failure_event_v2(
     user_id: str,
     user_data: Dict[str, Any],
     items_meta: Dict[str, Dict[str, Any]],
-    pos_item: MEMCFItemState,
-    neg_item: MEMCFItemState,
+    pos_item: PairwiseItemState,
+    neg_item: PairwiseItemState,
     explanation: str,
     user_memory_before: str,
     user_memory_after: str,
@@ -3688,6 +4052,7 @@ def llm_ranking_v2(
     user_profile: Optional[UserMemoryProfile],
     memory_facets: Optional[List[str]],
     prompt_sample: str = "",
+    ranking_prompt_style: str = "memcf",
     trace_context: Optional[Dict[str, Any]] = None,
 ) -> List[str]:
     candidate_info = [
@@ -3699,7 +4064,15 @@ def llm_ranking_v2(
     profile_block = user_profile.to_prompt_dict() if user_profile else {}
     facets = [str(x) for x in (memory_facets or []) if str(x).strip()]
 
-    if facets:
+    if ranking_prompt_style == "compact_score":
+        prompt = build_compact_score_prompt(
+            history_items=train_items[-10:],
+            aliased_candidates=aliased_candidates,
+            prompt_sample=prompt_sample,
+            memory_payload=facets if facets else None,
+            user_profile_payload=profile_block if profile_block else None,
+        )
+    elif facets:
         prompt = f"""
 You are scoring candidate items for a recommender system.
 
@@ -3784,11 +4157,13 @@ JSON format:
                 "minItems": len(valid_candidate_aliases),
                 "maxItems": len(valid_candidate_aliases),
             },
-            "reasoning": {"type": "string"},
         },
-        "required": ["scores", "reasoning"],
+        "required": ["scores"],
         "additionalProperties": False,
     }
+    if ranking_prompt_style != "compact_score":
+        score_json_schema["properties"]["reasoning"] = {"type": "string"}
+        score_json_schema["required"] = ["scores", "reasoning"]
 
     max_retries = int(os.getenv("MEMCF_RANK_RETRIES", "1"))
     current_prompt = prompt
@@ -3822,7 +4197,7 @@ JSON format:
             memory_system._trace("ranking_llm", {
                 **(trace_context or {}),
                 "attempt": attempt,
-                "memcf_v2": True,
+                "memcf_graph": True,
                 "ranking_mode": "score_based_candidate_alias_graph_facets",
                 "prompt": current_prompt,
                 "answer": raw_response,
@@ -3865,13 +4240,18 @@ Retry now. Return ONLY valid JSON with exactly one score row for every candidate
 def train_memory_graph_from_fail_interactions_v2(
     user_id: str,
     user_data: Dict[str, Any],
+    negative_data: Optional[Dict[str, Any]],
     items_meta: Dict[str, Dict[str, Any]],
     memory_system: RecommendationMemorySystem,
-    user_states: Dict[str, MEMCFUserState],
-    item_states: Dict[str, MEMCFItemState],
+    user_states: Dict[str, PairwiseUserState],
+    item_states: Dict[str, PairwiseItemState],
     graph: MemoryGraphIndex,
     max_iterations: int = 1,
     max_positive_interactions: Optional[int] = None,
+    candidate_negative_mode: str = "random",
+    min_lesson_confidence: float = 0.25,
+    max_lesson_risk: float = 0.85,
+    max_failure_lessons_per_user: int = 3,
 ) -> List[FailureLesson]:
     train_items = user_data.get("train", [])
     if max_positive_interactions and max_positive_interactions > 0:
@@ -3888,16 +4268,24 @@ def train_memory_graph_from_fail_interactions_v2(
         pos_item_id = str(pos_item_id)
         if pos_item_id not in item_states:
             continue
-        neg_candidates = [iid for iid in all_item_ids if iid != pos_item_id]
-        if not neg_candidates:
+        neg_item_id = choose_training_negative_item_id(
+            user_id=str(user_id),
+            pos_item_id=str(pos_item_id),
+            user_data=user_data,
+            negative_data=negative_data,
+            items_meta=items_meta,
+            all_item_ids=all_item_ids,
+            mode=candidate_negative_mode,
+            max_positive_interactions=max_positive_interactions,
+        )
+        if not neg_item_id:
             continue
-        neg_item_id = deterministic_shuffle(neg_candidates, salt=f"memcf_v2_neg_{user_id}_{pos_item_id}")[0]
         pos_item = item_states[pos_item_id]
         neg_item = item_states[neg_item_id]
 
         for _ in range(max_iterations):
             user_memory_before = user_state.short_term_memory
-            chosen_item_id, explanation = autonomous_pairwise_choice(
+            chosen_item_id, explanation = autonomous_pairwise_interaction(
                 memory_system=memory_system,
                 user_state=user_state,
                 pos_item=pos_item,
@@ -3914,7 +4302,7 @@ def train_memory_graph_from_fail_interactions_v2(
                 user_state.add_interaction(pos_item_id)
                 break
             try:
-                collaborative_failure_reflection(
+                corrective_pairwise_reflection(
                     memory_system=memory_system,
                     user_state=user_state,
                     pos_item=pos_item,
@@ -3947,6 +4335,23 @@ def train_memory_graph_from_fail_interactions_v2(
             lesson = create_failure_lesson_v2(memory_system, event)
             if lesson is None:
                 continue
+            passed_gate, gate_reason = failure_lesson_passes_quality_gate_v2(
+                lesson,
+                min_confidence=min_lesson_confidence,
+                max_risk=max_lesson_risk,
+            )
+            memory_system._trace("memory_quality_gate", {
+                "user_id": user_id,
+                "positive_item_id": pos_item.item_id,
+                "negative_item_id": neg_item.item_id,
+                "passed": passed_gate,
+                "reason": gate_reason,
+                "min_lesson_confidence": min_lesson_confidence,
+                "max_lesson_risk": max_lesson_risk,
+                "lesson": asdict(lesson),
+            })
+            if not passed_gate:
+                continue
             graph.add_lesson(lesson)
             new_lessons.append(lesson)
             memory_system._trace("global_memory_added", {
@@ -3959,6 +4364,13 @@ def train_memory_graph_from_fail_interactions_v2(
                     "history_item_ids": lesson.history_item_ids,
                 },
             })
+            if max_failure_lessons_per_user > 0 and len(new_lessons) >= max_failure_lessons_per_user:
+                memory_system._trace("memory_generation_limit_reached", {
+                    "user_id": user_id,
+                    "max_failure_lessons_per_user": max_failure_lessons_per_user,
+                    "current_count": len(new_lessons),
+                })
+                return new_lessons
     return new_lessons
 
 
@@ -3978,6 +4390,7 @@ def evaluate_user_v2(
     max_positive_interactions: Optional[int] = None,
     max_negative_candidates: Optional[int] = None,
     no_harm_arbitration: bool = False,
+    ranking_prompt_style: str = "memcf",
 ) -> Tuple[Dict[str, float], Dict[str, float], List[str], List[str], List[str]]:
     if eval_type == "val":
         ground_truth = [str(x) for x in user_data.get("val", [])]
@@ -4059,11 +4472,13 @@ def evaluate_user_v2(
         memory_system.memory_diagnostics["no_harm_users"] += 1
         no_memory_predictions = llm_ranking_v2(
             memory_system, train_items_info, candidate_items_info, user_profile, [],
+            ranking_prompt_style=ranking_prompt_style,
             trace_context={"user_id": user_id, "eval_type": eval_type, "ranking_path": "v2_no_harm_no_memory"},
         )
         if memory_facets:
             memory_predictions = llm_ranking_v2(
                 memory_system, train_items_info, candidate_items_info, user_profile, memory_facets,
+                ranking_prompt_style=ranking_prompt_style,
                 trace_context={"user_id": user_id, "eval_type": eval_type, "ranking_path": "v2_no_harm_memory"},
             )
             # Conservative rule: use memory only if the reader accepted facets and
@@ -4107,6 +4522,7 @@ def evaluate_user_v2(
     else:
         predictions = llm_ranking_v2(
             memory_system, train_items_info, candidate_items_info, user_profile, memory_facets,
+            ranking_prompt_style=ranking_prompt_style,
             trace_context={
                 "user_id": user_id,
                 "eval_type": eval_type,
@@ -4142,6 +4558,7 @@ def evaluate_user_v2(
         "metrics": metrics,
         "baseline_metrics": baseline_metric,
         "selected_ranking_source": selected_ranking_source,
+        "ranking_prompt_style": ranking_prompt_style,
         "memory_reader_result": memory_reader_result,
         "retrieved_graph_lessons": [
             {
@@ -4173,6 +4590,13 @@ def parse_args_v2():
     parser.add_argument("--neighbor_k", type=int, default=10)
     parser.add_argument("--min_evidence_terms", type=int, default=1)
     parser.add_argument("--no_harm_arbitration", action="store_true", default=False)
+    parser.add_argument("--candidate_negative_mode", type=str, default="candidate_hard",
+                        choices=["random", "candidate_hard"])
+    parser.add_argument("--min_lesson_confidence", type=float, default=0.25)
+    parser.add_argument("--max_lesson_risk", type=float, default=0.85)
+    parser.add_argument("--max_failure_lessons_per_user", type=int, default=3)
+    parser.add_argument("--ranking_prompt_style", type=str, default="compact_score",
+                        choices=["memcf", "compact_score"])
     parser.add_argument("--trace_dir", type=str, default=None)
     parser.add_argument("--disable_trace", action="store_false", dest="trace_enabled")
     parser.set_defaults(trace_enabled=True)
@@ -4213,11 +4637,16 @@ def main_v2():
     number_of_users = args.number_of_users
     max_positive_interactions = args.max_positive_interactions
     max_negative_candidates = args.max_negative_candidates
+    candidate_negative_mode = args.candidate_negative_mode
+    min_lesson_confidence = args.min_lesson_confidence
+    max_lesson_risk = args.max_lesson_risk
+    max_failure_lessons_per_user = args.max_failure_lessons_per_user
+    ranking_prompt_style = args.ranking_prompt_style
 
-    base_dir = os.getenv("MEMCF_ROOT") or os.path.dirname(os.path.abspath(__file__))
-    data_root = os.getenv("MEMCF_DATA_ROOT") or os.path.join(base_dir, "data")
-    eval_root = os.getenv("MEMCF_EVAL_ROOT") or os.path.join(base_dir, "evaluation_results")
-    memory_root = os.getenv("MEMCF_MEMORY_ROOT") or os.path.join(base_dir, "agent_memory")
+    base_dir = os.getenv("AGENTICREC_CFMEMORY_ROOT", os.path.dirname(os.path.abspath(__file__)))
+    data_root = os.getenv("AGENTICREC_DATA_ROOT", os.path.join(base_dir, "data"))
+    eval_root = os.getenv("AGENTICREC_EVAL_ROOT", os.path.join(base_dir, "evaluation_results"))
+    memory_root = os.getenv("AGENTICREC_MEMORY_ROOT", os.path.join(base_dir, "agent_memory"))
     data_dir = os.path.join(data_root, data_name)
     eval_dir = os.path.join(eval_root, data_name)
     memory_dir = os.path.join(memory_root, data_name)
@@ -4233,11 +4662,11 @@ def main_v2():
     print(f"MEMCF selected users: {len(user_ids)}")
 
     run_name = (
-        f"memcf_v2_graph_nuser{number_of_users}_iter{args.max_iterations}"
+        f"memcf_graph_nuser{number_of_users}_iter{args.max_iterations}"
         f"_gk{args.graph_memory_k}_nk{args.neighbor_k}_ev{args.min_evidence_terms}"
     )
     if not use_memory:
-        run_name = f"memcf_v2_nomemory_nuser{number_of_users}"
+        run_name = f"memcf_nomemory_nuser{number_of_users}"
 
     trace_dir = args.trace_dir or os.path.join(
         eval_dir,
@@ -4250,8 +4679,8 @@ def main_v2():
 
     memory_system = RecommendationMemorySystem(use_gemini_embeddings=True)
     memory_system.trace_recorder = trace_recorder
-    item_states = init_memcf_item_states(items_meta)
-    user_states: Dict[str, MEMCFUserState] = {}
+    item_states = init_pairwise_item_states(items_meta)
+    user_states: Dict[str, PairwiseUserState] = {}
     graph = MemoryGraphIndex(user_sequences)
     user_profiles: Dict[str, UserMemoryProfile] = {}
     memory_file_path = os.path.join(memory_dir, f"{run_name}.memory.json")
@@ -4261,7 +4690,7 @@ def main_v2():
             print(f"Loading MEMCF graph memory from {memory_file_path}")
             graph, user_profiles = load_v2_memory(memory_file_path, user_sequences)
             for uid, profile in user_profiles.items():
-                user_states[uid] = MEMCFUserState(user_id=uid, short_term_memory=profile.profile)
+                user_states[uid] = PairwiseUserState(user_id=uid, short_term_memory=profile.profile)
         else:
             print("\n" + "=" * 80)
             print("PHASE 0: INITIALIZE USER MEMORY FROM HISTORY")
@@ -4275,7 +4704,7 @@ def main_v2():
                     max_positive_interactions=max_positive_interactions,
                 )
                 user_profiles[str(user_id)] = profile
-                user_states[str(user_id)] = MEMCFUserState(
+                user_states[str(user_id)] = PairwiseUserState(
                     user_id=str(user_id),
                     short_term_memory=profile.profile,
                 )
@@ -4285,7 +4714,7 @@ def main_v2():
                 })
 
             print("\n" + "=" * 80)
-            print("PHASE 1: AGENTCF-STYLE FAILURE TRAINING -> GRAPH LESSONS")
+            print("PHASE 1: PAIRWISE FAILURE TRAINING -> GRAPH LESSONS")
             print("=" * 80)
             total_lessons = 0
             for user_id in tqdm(user_ids, desc="Graph failure training"):
@@ -4293,6 +4722,7 @@ def main_v2():
                 lessons = train_memory_graph_from_fail_interactions_v2(
                     user_id=str(user_id),
                     user_data=user_sequences[user_id],
+                    negative_data=user_negatives.get(user_id, {}),
                     items_meta=items_meta,
                     memory_system=memory_system,
                     user_states=user_states,
@@ -4300,6 +4730,10 @@ def main_v2():
                     graph=graph,
                     max_iterations=args.max_iterations,
                     max_positive_interactions=max_positive_interactions,
+                    candidate_negative_mode=candidate_negative_mode,
+                    min_lesson_confidence=min_lesson_confidence,
+                    max_lesson_risk=max_lesson_risk,
+                    max_failure_lessons_per_user=max_failure_lessons_per_user,
                 )
                 total_lessons += len(lessons)
                 print(f"  → Generated {len(lessons)} graph failure lessons")
@@ -4333,6 +4767,7 @@ def main_v2():
             max_positive_interactions=max_positive_interactions,
             max_negative_candidates=max_negative_candidates,
             no_harm_arbitration=args.no_harm_arbitration,
+            ranking_prompt_style=ranking_prompt_style,
         )
         for metric_name, value in metrics.items():
             val_metrics[metric_name].append(value)
@@ -4350,7 +4785,7 @@ def main_v2():
     if use_memory:
         output_file = os.path.join(eval_dir, f"{run_name}.json")
     else:
-        output_file = os.path.join(eval_dir, "memcf_v2_zeroshot_users_ranking_no_memory.json")
+        output_file = os.path.join(eval_dir, "memcf_zeroshot_users_ranking_no_memory.json")
     save_all_users_ranking_results(all_user_results, items_meta, output_file)
 
     print("\nValidation Results:")
@@ -4378,6 +4813,11 @@ def main_v2():
         "max_iterations": args.max_iterations,
         "max_positive_interactions": max_positive_interactions,
         "max_negative_candidates": max_negative_candidates,
+        "candidate_negative_mode": candidate_negative_mode,
+        "min_lesson_confidence": min_lesson_confidence,
+        "max_lesson_risk": max_lesson_risk,
+        "max_failure_lessons_per_user": max_failure_lessons_per_user,
+        "ranking_prompt_style": ranking_prompt_style,
         "graph_memory_k": args.graph_memory_k,
         "neighbor_k": args.neighbor_k,
         "min_evidence_terms": args.min_evidence_terms,

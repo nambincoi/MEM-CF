@@ -74,7 +74,8 @@ MEMCF/
 ├── scripts/
 │   ├── run_smoke.sh                  # 5-user smoke test
 │   ├── run_ablation_one_dataset.sh   # Run one dataset and one ablation variant
-│   └── run_16_ablation_jobs.sh       # Launch 4 datasets x 4 variants in parallel
+│   ├── run_16_ablation_jobs.sh       # Launch 4 datasets x 4 variants in parallel
+│   └── compare_memory_vs_nomemory.py # Paired significance test for ranking JSONs
 ├── docs/
 │   ├── DATA_FORMAT.md                # Expected runtime data format
 │   ├── TRACE_FORMAT.md               # Trace files and how to inspect them
@@ -94,8 +95,8 @@ The reference implementation is intentionally kept in one file so that experimen
 | Symbol | Role |
 | --- | --- |
 | `TraceRecorder` | Writes per-event JSONL traces and a chronological `events.jsonl`. |
-| `MEMCFUserState` | Stores compact user-level memory initialized from history. |
-| `MEMCFItemState` | Stores compact item-level state for pairwise training. |
+| `PairwiseUserState` | Stores compact user-level memory initialized from history. |
+| `PairwiseItemState` | Stores compact item-level state for pairwise training. |
 | `RecommendationMemorySystem` | Owns LLM calls, memory creation, tracing, and diagnostics. |
 | `MemoryGraphIndex` | Maintains graph links between users, items, and failure lessons. |
 | `initialize_user_memory_from_history_v2` | Builds initial user memory from history before failure training. |
@@ -170,7 +171,8 @@ python -m memcf \
   --number_of_users 100 \
   --no_use_memory \
   --max_positive_interactions 5 \
-  --max_negative_candidates 19
+  --max_negative_candidates 19 \
+  --ranking_prompt_style compact_score
 ```
 
 Run MEMCF with graph memory:
@@ -183,6 +185,11 @@ python -m memcf \
   --max_iterations 1 \
   --max_positive_interactions 5 \
   --max_negative_candidates 19 \
+  --candidate_negative_mode candidate_hard \
+  --min_lesson_confidence 0.25 \
+  --max_lesson_risk 0.85 \
+  --max_failure_lessons_per_user 3 \
+  --ranking_prompt_style compact_score \
   --graph_memory_k 3 \
   --neighbor_k 10 \
   --min_evidence_terms 1
@@ -198,11 +205,30 @@ python -m memcf \
   --max_iterations 1 \
   --max_positive_interactions 5 \
   --max_negative_candidates 19 \
+  --candidate_negative_mode candidate_hard \
+  --min_lesson_confidence 0.25 \
+  --max_lesson_risk 0.85 \
+  --max_failure_lessons_per_user 3 \
+  --ranking_prompt_style compact_score \
   --graph_memory_k 3 \
   --neighbor_k 10 \
   --min_evidence_terms 1 \
   --no_harm_arbitration
 ```
+
+### Current Default Research Settings
+
+The scripts default to the strongest current MEMCF configuration:
+
+| Option | Default | Purpose |
+| --- | --- | --- |
+| `--ranking_prompt_style` | `compact_score` | Compact score-based reranking prompt used for both no-memory and memory runs. |
+| `--candidate_negative_mode` | `candidate_hard` | Samples training negatives from each user's runtime candidate pool when possible. |
+| `--min_lesson_confidence` | `0.25` | Filters very weak generated failure lessons. |
+| `--max_lesson_risk` | `0.85` | Filters over-generalized lessons that are likely to transfer poorly. |
+| `--max_failure_lessons_per_user` | `3` | Caps noisy lesson accumulation per user. |
+| `--graph_memory_k` | `3` for A1/A2, `5` for A3 | Controls how many short memory facts are retrieved. |
+| `--neighbor_k` | `10` | Limits graph-neighbor expansion. |
 
 ## Recommended Ablations
 

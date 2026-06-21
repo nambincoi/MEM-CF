@@ -2,7 +2,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-export MEMCF_EVAL_ROOT="${MEMCF_EVAL_ROOT:-$ROOT/evaluation_results}"
+export MEMCF_EVAL_ROOT="${MEMCF_EVAL_ROOT:-$ROOT/evaluation_results_memcf_strong}"
+export MEMCF_MEMORY_ROOT="${MEMCF_MEMORY_ROOT:-$ROOT/agent_memory_memcf_strong}"
+export RANKING_PROMPT_STYLE="${RANKING_PROMPT_STYLE:-compact_score}"
 PID_DIR="$MEMCF_EVAL_ROOT/_pids"
 mkdir -p "$PID_DIR"
 
@@ -35,3 +37,5 @@ done
 echo "PID files: $PID_DIR"
 echo "Check status with:"
 echo "for p in $PID_DIR/*.pid; do pid=\$(cat \"\$p\"); ps -p \"\$pid\" >/dev/null && echo RUNNING \$(basename \"\$p\") \"\$pid\" || echo DONE \$(basename \"\$p\") \"\$pid\"; done"
+echo "Logs:"
+echo "find $MEMCF_EVAL_ROOT -path '*/logs/*.log' -type f | sort"
