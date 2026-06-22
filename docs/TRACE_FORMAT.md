@@ -8,6 +8,12 @@ $MEMCF_EVAL_ROOT/<dataset>/traces/<run_name_timestamp>/
 
 Each event type is saved as `<event_type>.jsonl`. The global chronological stream is saved as `events.jsonl`.
 
+Every completed run also writes a summary JSON next to the ranking JSON. The summary includes:
+
+- `runtime`: wall-clock time, start/end timestamps, and seconds per evaluated user
+- `llm_usage`: total LLM calls, token counts, seconds, errors, and breakdown by call type
+- `memory_diagnostics`: retrieval, ranking parser, and no-harm arbitration counters
+
 ## Core Training Traces
 
 | File | Meaning |
@@ -30,11 +36,37 @@ Each event type is saved as `<event_type>.jsonl`. The global chronological strea
 | `ranking_result.jsonl` | Per-user ranking, answer item, and metrics metadata. |
 | `no_harm_arbitration.jsonl` | Decision between memory and no-memory ranking when enabled. |
 
+## LLM Usage Trace
+
+| File | Meaning |
+| --- | --- |
+| `llm_call.jsonl` | One record per LLM call with `call_type`, `model`, prompt/completion character counts, token counts, elapsed seconds, and error status. It intentionally does not duplicate full prompt text; full prompts are in the task-specific trace files such as `ranking_llm.jsonl` and `failure_lesson_llm.jsonl`. |
+
 ## Quick Inspection
 
 ```bash
 TRACE=/path/to/trace_dir
 find "$TRACE" -maxdepth 1 -type f -name "*.jsonl" -printf "%f\t" -exec wc -l {} \;
+```
+
+Summarize LLM calls by type:
+
+```bash
+python3 - <<'PY'
+import json
+from collections import defaultdict
+from pathlib import Path
+trace = Path('/path/to/trace_dir')
+stats = defaultdict(lambda: defaultdict(float))
+for line in (trace / 'llm_call.jsonl').open():
+    obj = json.loads(line)
+    key = obj.get('call_type', 'unknown')
+    stats[key]['calls'] += 1
+    stats[key]['total_tokens'] += obj.get('total_tokens') or 0
+    stats[key]['seconds'] += obj.get('seconds') or 0
+for key, vals in sorted(stats.items()):
+    print(key, dict(vals))
+PY
 ```
 
 Show the first two memory retrieval records:

@@ -11,10 +11,90 @@ import random
 import pickle
 import time
 import re
+import html
 import hashlib
 import urllib.request
 import urllib.error
 import argparse
+
+
+def slugify(value: Any) -> str:
+    """Make a short filesystem-safe value for run names."""
+    text = str(value)
+    text = re.sub(r"[^A-Za-z0-9]+", "_", text).strip("_")
+    return text[:80] or "none"
+
+
+def float_tag(value: float) -> str:
+    """Stable compact float tag for filenames, e.g. 0.25 -> 0p25."""
+    return f"{float(value):.3g}".replace(".", "p").replace("-", "m")
+
+
+def stable_shard_filter(values: List[str], shard_id: int, num_shards: int) -> List[str]:
+    """Select a deterministic user shard without changing the global user order."""
+    if num_shards <= 1:
+        return list(values)
+    if shard_id < 0 or shard_id >= num_shards:
+        raise ValueError(f"Invalid shard_id={shard_id} for num_shards={num_shards}")
+    return [v for idx, v in enumerate(values) if idx % num_shards == shard_id]
+
+
+def shorten_words(text: Any, max_words: int) -> str:
+    """Sentence-safe word cap used before memory facts enter ranking prompts."""
+    cleaned = re.sub(r"\s+", " ", str(text or "")).strip()
+    if max_words <= 0:
+        return cleaned
+    words = cleaned.split()
+    if len(words) <= max_words:
+        return cleaned
+    return " ".join(words[:max_words]).rstrip(" .,;:") + "..."
+
+
+def estimate_simple_tokens(text: Any) -> int:
+    return max(1, int(len(str(text or "")) / 4)) if str(text or "") else 0
+
+
+def pack_memory_facts(
+    rows: List[Tuple[str, Dict[str, Any]]],
+    max_facts: int,
+    max_words: int,
+    token_budget: int,
+) -> Tuple[List[str], List[Dict[str, Any]]]:
+    """Pack short corrective facts by score order under a small token budget.
+
+    This is deliberately simpler than MemRec's neighbor packer: MEMCF packs only
+    failure-contrastive facts that already passed graph/applicability gates.
+    """
+    facts: List[str] = []
+    audit: List[Dict[str, Any]] = []
+    used_tokens = 0
+    for fact, row in rows:
+        if max_facts > 0 and len(facts) >= max_facts:
+            break
+        short = shorten_words(fact, max_words)
+        needed = estimate_simple_tokens(short)
+        if token_budget > 0 and facts and used_tokens + needed > token_budget:
+            row = dict(row)
+            row["pack_decision"] = "skip_budget"
+            row["packed_tokens"] = needed
+            row["used_tokens_before"] = used_tokens
+            audit.append(row)
+            continue
+        facts.append(short)
+        used_tokens += needed
+        row = dict(row)
+        row["pack_decision"] = "keep"
+        row["packed_fact"] = short
+        row["packed_tokens"] = needed
+        row["used_tokens_after"] = used_tokens
+        audit.append(row)
+    return facts, audit
+
+
+def has_metadata_noise(text: Any) -> bool:
+    """Detect HTML/entity artifacts that often indicate noisy item metadata."""
+    raw = str(text or "")
+    return bool(re.search(r"<[^>]+>|&[A-Za-z]+;|a-size-|a-color-|span class|h1 class", raw, re.I))
 
 
 def extract_json_object(raw_output: str) -> Dict[str, Any]:
@@ -133,6 +213,7 @@ def add_candidate_aliases(candidate_items: List[Dict[str, Any]]) -> Tuple[List[D
             "candidate_id": alias,
             "title": row.get("title", ""),
             "category": row.get("category", "Unknown"),
+            "description": row.get("description", ""),
         })
     return aliased, alias_to_item_id
 
@@ -383,7 +464,29 @@ def item_category(item_info: Dict[str, Any], fallback: str = "Unknown") -> str:
 
 def item_title(item_info: Dict[str, Any], item_id: str) -> str:
     title = str(item_info.get("title") or "").strip()
+    title = html.unescape(re.sub(r"<[^>]+>", " ", title))
+    title = re.sub(r"\s+", " ", title).strip()
     return title if title else f"Item {item_id}"
+
+
+def item_description(item_info: Dict[str, Any], max_chars: int = 220) -> str:
+    raw = (
+        item_info.get("description")
+        or item_info.get("description_short")
+        or item_info.get("feature")
+        or ""
+    )
+    if isinstance(raw, list):
+        raw = " ".join(str(x) for x in raw if str(x).strip())
+    elif isinstance(raw, dict):
+        raw = " ".join(str(x) for x in raw.values() if str(x).strip())
+    text = html.unescape(str(raw))
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\b(Product Description|Amazon\\.com|Product description)\b", " ", text, flags=re.I)
+    text = re.sub(r"\s+", " ", text).strip(" []'\",")
+    if len(text) > max_chars:
+        text = text[:max_chars].rsplit(" ", 1)[0].rstrip(" .,;:") + "..."
+    return text
 
 
 def ranking_validation(raw_ranked_ids: List[Any], candidate_items: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -840,10 +943,100 @@ class RecommendationMemorySystem:
         self.next_thought_id = 0
         self.trace_recorder: Optional[TraceRecorder] = None
         self.memory_diagnostics = defaultdict(float)
+        self.llm_usage = defaultdict(float)
+        self.llm_usage_by_type: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
 
     def _trace(self, event_type: str, payload: Dict[str, Any]) -> None:
         if getattr(self, "trace_recorder", None) is not None:
             self.trace_recorder.log(event_type, payload)
+
+    def _estimate_token_count(self, text: str) -> int:
+        text = str(text or "")
+        if not text:
+            return 0
+        tokenizer = getattr(self, "tokenizer", None)
+        if tokenizer is not None:
+            try:
+                return int(len(tokenizer.encode(text, add_special_tokens=False)))
+            except Exception:
+                pass
+        # Conservative fallback used when running through an API without tokenizer.
+        return max(1, int(len(text) / 4))
+
+    def _record_llm_usage(
+        self,
+        call_type: str,
+        prompt: str,
+        role_prompt: str,
+        output: str,
+        duration_seconds: float,
+        usage: Optional[Dict[str, Any]] = None,
+        success: bool = True,
+        error: Optional[str] = None,
+    ) -> None:
+        usage = usage or {}
+        prompt_tokens = usage.get("prompt_tokens")
+        completion_tokens = usage.get("completion_tokens")
+        total_tokens = usage.get("total_tokens")
+        if prompt_tokens is None:
+            prompt_tokens = self._estimate_token_count(str(role_prompt) + "\n" + str(prompt))
+        if completion_tokens is None:
+            completion_tokens = self._estimate_token_count(output)
+        if total_tokens is None:
+            total_tokens = int(prompt_tokens or 0) + int(completion_tokens or 0)
+
+        call_type = str(call_type or "generic")
+        metrics = {
+            "calls": 1,
+            "prompt_tokens": int(prompt_tokens or 0),
+            "completion_tokens": int(completion_tokens or 0),
+            "total_tokens": int(total_tokens or 0),
+            "seconds": float(duration_seconds),
+            "errors": 0 if success else 1,
+        }
+        for key, value in metrics.items():
+            self.llm_usage[key] += value
+            self.llm_usage_by_type[call_type][key] += value
+
+        self._trace("llm_call", {
+            "call_type": call_type,
+            "success": success,
+            "error": error,
+            "model": self.chat_model_name if self.use_api_chat else self.llm_name,
+            "prompt_chars": len(str(prompt or "")),
+            "completion_chars": len(str(output or "")),
+            "prompt_tokens": int(prompt_tokens or 0),
+            "completion_tokens": int(completion_tokens or 0),
+            "total_tokens": int(total_tokens or 0),
+            "seconds": float(duration_seconds),
+        })
+
+    def get_llm_usage_summary(self) -> Dict[str, Any]:
+        total_calls = int(self.llm_usage.get("calls", 0))
+        total_seconds = float(self.llm_usage.get("seconds", 0.0))
+        total_tokens = int(self.llm_usage.get("total_tokens", 0))
+        by_type = {
+            key: {
+                "calls": int(vals.get("calls", 0)),
+                "prompt_tokens": int(vals.get("prompt_tokens", 0)),
+                "completion_tokens": int(vals.get("completion_tokens", 0)),
+                "total_tokens": int(vals.get("total_tokens", 0)),
+                "seconds": float(vals.get("seconds", 0.0)),
+                "errors": int(vals.get("errors", 0)),
+            }
+            for key, vals in sorted(self.llm_usage_by_type.items())
+        }
+        return {
+            "calls": total_calls,
+            "prompt_tokens": int(self.llm_usage.get("prompt_tokens", 0)),
+            "completion_tokens": int(self.llm_usage.get("completion_tokens", 0)),
+            "total_tokens": total_tokens,
+            "seconds": total_seconds,
+            "errors": int(self.llm_usage.get("errors", 0)),
+            "avg_seconds_per_call": total_seconds / total_calls if total_calls else 0.0,
+            "avg_tokens_per_call": total_tokens / total_calls if total_calls else 0.0,
+            "by_call_type": by_type,
+        }
 
     def _post_json(self, url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         headers = {"Content-Type": "application/json"}
@@ -875,7 +1068,9 @@ class RecommendationMemorySystem:
         max_new_tokens=8000,
         json_schema: Optional[Dict[str, Any]] = None,
         json_mode: bool = False,
+        call_type: str = "generic",
     ) -> str:
+        start_time = time.time()
         if self.use_api_chat:
             endpoint = f"{self.chat_api_base}/chat/completions"
             temperature = float(os.getenv("MEMCF_TEMPERATURE", "0.0"))
@@ -904,13 +1099,37 @@ class RecommendationMemorySystem:
                 # Some OpenAI-compatible Qwen endpoints support JSON mode.
                 # The prompt/role must include the word JSON for those servers.
                 payload["response_format"] = {"type": "json_object"}
-            result = self._post_json(endpoint, payload)
-            content = result["choices"][0]["message"]["content"]
-            if isinstance(content, list):
-                return "".join(
-                    chunk.get("text", "") for chunk in content if isinstance(chunk, dict)
+            try:
+                result = self._post_json(endpoint, payload)
+                content = result["choices"][0]["message"]["content"]
+                if isinstance(content, list):
+                    output = "".join(
+                        chunk.get("text", "") for chunk in content if isinstance(chunk, dict)
+                    )
+                else:
+                    output = str(content)
+                self._record_llm_usage(
+                    call_type=call_type,
+                    prompt=prompt,
+                    role_prompt=role_prompt,
+                    output=output,
+                    duration_seconds=time.time() - start_time,
+                    usage=result.get("usage"),
+                    success=True,
                 )
-            return str(content)
+                return output
+            except Exception as e:
+                self._record_llm_usage(
+                    call_type=call_type,
+                    prompt=prompt,
+                    role_prompt=role_prompt,
+                    output="",
+                    duration_seconds=time.time() - start_time,
+                    usage=None,
+                    success=False,
+                    error=str(e),
+                )
+                raise
 
         messages = [
             {"role": "system", "content": role_prompt},
@@ -923,11 +1142,40 @@ class RecommendationMemorySystem:
         )
         inputs = self.tokenizer([text], return_tensors="pt").to(self.model.device)
 
-        with torch.no_grad():
-            outputs = self.model.generate(**inputs, max_new_tokens=max_new_tokens)
+        try:
+            with torch.no_grad():
+                outputs = self.model.generate(**inputs, max_new_tokens=max_new_tokens)
 
-        gen_ids = outputs[0][inputs["input_ids"].shape[-1]:]
-        return self.tokenizer.decode(gen_ids, skip_special_tokens=True)
+            prompt_tokens = int(inputs["input_ids"].shape[-1])
+            gen_ids = outputs[0][prompt_tokens:]
+            output = self.tokenizer.decode(gen_ids, skip_special_tokens=True)
+            completion_tokens = int(len(gen_ids))
+            self._record_llm_usage(
+                call_type=call_type,
+                prompt=prompt,
+                role_prompt=role_prompt,
+                output=output,
+                duration_seconds=time.time() - start_time,
+                usage={
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens,
+                },
+                success=True,
+            )
+            return output
+        except Exception as e:
+            self._record_llm_usage(
+                call_type=call_type,
+                prompt=prompt,
+                role_prompt=role_prompt,
+                output="",
+                duration_seconds=time.time() - start_time,
+                usage=None,
+                success=False,
+                error=str(e),
+            )
+            raise
 
 
     def _cosine_similarity(self, a: np.ndarray, b: np.ndarray) -> float:
@@ -1009,7 +1257,11 @@ class RecommendationMemorySystem:
 
         try:
             # response = self.model.generate_content(prompt)
-            response = self.qwen_generate(prompt=prompt, role_prompt='You are a behavioral memory modeling system.')
+            response = self.qwen_generate(
+                prompt=prompt,
+                role_prompt='You are a behavioral memory modeling system.',
+                call_type="memory_create",
+            )
             # time.sleep(5)
             result = extract_json_object(response)
             self._trace("memory_create_llm", {
@@ -1159,7 +1411,11 @@ class RecommendationMemorySystem:
         try:
             # response = self.model.generate_content(prompt)
             # time.sleep(3)
-            response = self.qwen_generate(prompt=prompt, role_prompt='You are a behavioral memory modeling system.')
+            response = self.qwen_generate(
+                prompt=prompt,
+                role_prompt='You are a behavioral memory modeling system.',
+                call_type="memory_link",
+            )
 
             result = extract_json_object(response)
             self._trace("memory_link_llm", {
@@ -1262,7 +1518,11 @@ class RecommendationMemorySystem:
         try:
             # response = self.model.generate_content(prompt)
             # time.sleep(3)
-            response = self.qwen_generate(prompt=prompt, role_prompt='You are a behavioral memory modeling system.')
+            response = self.qwen_generate(
+                prompt=prompt,
+                role_prompt='You are a behavioral memory modeling system.',
+                call_type="memory_evolve",
+            )
             result = extract_json_object(response)
             self._trace("memory_evolve_llm", {
                 "prompt": prompt,
@@ -1564,6 +1824,7 @@ JSON format:
                     max_new_tokens=int(os.getenv("MEMCF_RANK_MAX_TOKENS", "1400")),
                     json_schema=score_json_schema,
                     json_mode=True,
+                    call_type="ranking",
                 )
                 try:
                     result = extract_json_object(raw_response)
@@ -2033,7 +2294,7 @@ Explanation: [Your detailed reasoning]
 
 Important: You must choose one of these two candidates."""
 
-    response = memory_system.qwen_generate(prompt=prompt)
+    response = memory_system.qwen_generate(prompt=prompt, call_type="pairwise_choice")
     chosen_item_id = pos_item.item_id
     if "Chosen Item: 1" in response or "chosen item: 1" in response.lower():
         chosen_item_id = neg_item.item_id
@@ -2079,7 +2340,7 @@ My updated self-introduction: [Your updated preferences in under 150 words]
 
 Important: Focus on what features you like and dislike, be specific and personalized."""
 
-    new_user_memory = memory_system.qwen_generate(prompt=user_prompt)
+    new_user_memory = memory_system.qwen_generate(prompt=user_prompt, call_type="reflection_user")
     memory_system._trace("reflection_user_memory_llm", {
         "user_id": user_state.user_id,
         "prompt": user_prompt,
@@ -2122,7 +2383,7 @@ Output format (STRICT JSON, no extra text):
 
 Important: Make it specific and aligned with user preferences."""
 
-    new_item_memory = memory_system.qwen_generate(prompt=item_prompt)
+    new_item_memory = memory_system.qwen_generate(prompt=item_prompt, call_type="reflection_item")
     memory_system._trace("reflection_item_memory_llm", {
         "user_id": user_state.user_id,
         "prompt": item_prompt,
@@ -3302,6 +3563,7 @@ def _item_info_for_prompt(item_id: str, items_meta: Dict[str, Dict[str, Any]]) -
         "item_id": item_id,
         "title": item_title(info, item_id) if isinstance(info, dict) else f"Item {item_id}",
         "category": item_category(info) if isinstance(info, dict) else "Unknown",
+        "description": item_description(info) if isinstance(info, dict) else "",
     }
 
 
@@ -3310,7 +3572,10 @@ def _history_item_infos(item_ids: List[str], items_meta: Dict[str, Dict[str, Any
 
 
 def _context_text_from_items(items: List[Dict[str, Any]]) -> str:
-    return " ".join(f"{x.get('title', '')} {x.get('category', '')}" for x in items).lower()
+    return " ".join(
+        f"{x.get('title', '')} {x.get('category', '')} {x.get('description', '')}"
+        for x in items
+    ).lower()
 
 
 def _item_tokens_for_hard_negative(item_id: str, items_meta: Dict[str, Dict[str, Any]]) -> Set[str]:
@@ -3432,6 +3697,8 @@ class MemoryGraphIndex:
         top_k: int = 3,
         neighbor_k: int = 10,
         min_evidence_terms: int = 1,
+        retrieval_scope: str = "full",
+        shuffle_salt: str = "",
     ) -> List[GraphRetrievedLesson]:
         user_id = str(user_id)
         scores: Dict[str, float] = defaultdict(float)
@@ -3439,29 +3706,54 @@ class MemoryGraphIndex:
         paths: Dict[str, List[str]] = defaultdict(list)
         candidate_set = set(str(x) for x in candidate_ids)
         history_set = set(str(x) for x in recent_history_ids)
+        retrieval_scope = str(retrieval_scope or "full").strip().lower()
+        if retrieval_scope in {"graph", "graph_only", "fail_graph"}:
+            retrieval_scope = "full"
+        if retrieval_scope not in {
+            "full", "same_user", "candidate_item", "history_item",
+            "neighbor_user", "random_memory", "shuffled_memory",
+        }:
+            raise ValueError(f"Unsupported graph_retrieval_scope={retrieval_scope}")
+
+        if retrieval_scope == "random_memory":
+            mids = deterministic_shuffle(list(self.lessons.keys()), salt=f"random_memory::{user_id}::{shuffle_salt}")
+            return [
+                GraphRetrievedLesson(
+                    lesson=self.lessons[mid],
+                    score=0.0,
+                    sources=["random_memory"],
+                    paths=[f"random_memory_control:{mid}"],
+                    matched_evidence_terms=[],
+                )
+                for mid in mids[:top_k]
+            ]
 
         for mid in self.memories_by_user.get(user_id, set()):
-            scores[mid] += 3.0
-            sources[mid].add("same_user")
-            paths[mid].append(f"user:{user_id}->memory:{mid}")
+            if retrieval_scope in {"full", "same_user", "shuffled_memory"}:
+                scores[mid] += 3.0
+                sources[mid].add("same_user")
+                paths[mid].append(f"user:{user_id}->memory:{mid}")
 
-        for item_id in candidate_set:
-            for mid in self.memories_by_item.get(item_id, set()):
-                scores[mid] += 2.0
-                sources[mid].add("candidate_item")
-                paths[mid].append(f"candidate_item:{item_id}->memory:{mid}")
+        if retrieval_scope in {"full", "candidate_item", "shuffled_memory"}:
+            for item_id in candidate_set:
+                for mid in self.memories_by_item.get(item_id, set()):
+                    scores[mid] += 2.0
+                    sources[mid].add("candidate_item")
+                    paths[mid].append(f"candidate_item:{item_id}->memory:{mid}")
 
-        for item_id in history_set:
-            for mid in self.memories_by_item.get(item_id, set()):
-                scores[mid] += 1.5
-                sources[mid].add("history_item")
-                paths[mid].append(f"history_item:{item_id}->memory:{mid}")
+        if retrieval_scope in {"full", "history_item", "shuffled_memory"}:
+            for item_id in history_set:
+                for mid in self.memories_by_item.get(item_id, set()):
+                    scores[mid] += 1.5
+                    sources[mid].add("history_item")
+                    paths[mid].append(f"history_item:{item_id}->memory:{mid}")
 
-        for other_user, shared_count in self.similar_users(user_id, top_k=neighbor_k):
-            for mid in self.memories_by_user.get(other_user, set()):
-                scores[mid] += 1.0 + 0.2 * min(shared_count, 5)
-                sources[mid].add("neighbor_user")
-                paths[mid].append(f"user:{user_id}->shared_items:{shared_count}->user:{other_user}->memory:{mid}")
+        if retrieval_scope in {"full", "neighbor_user", "shuffled_memory"}:
+            for other_user, shared_count in self.similar_users(user_id, top_k=neighbor_k):
+                for mid in self.memories_by_user.get(other_user, set()):
+                    scores[mid] += 1.0 + 0.2 * min(shared_count, 5)
+                    sources[mid].add("neighbor_user")
+                    paths[mid].append(f"user:{user_id}->shared_items:{shared_count}->user:{other_user}->memory:{mid}")
 
         retrieved: List[GraphRetrievedLesson] = []
         for mid, score in scores.items():
@@ -3492,6 +3784,18 @@ class MemoryGraphIndex:
                 matched_evidence_terms=matched_terms,
             ))
         retrieved.sort(key=lambda r: (-r.score, r.lesson.memory_id))
+        if retrieval_scope == "shuffled_memory" and retrieved:
+            candidate_mids = deterministic_shuffle(list(self.lessons.keys()), salt=f"shuffled_memory::{user_id}::{shuffle_salt}")
+            shuffled: List[GraphRetrievedLesson] = []
+            for row, replacement_mid in zip(retrieved[:top_k], candidate_mids):
+                shuffled.append(GraphRetrievedLesson(
+                    lesson=self.lessons[replacement_mid],
+                    score=row.score,
+                    sources=sorted(set(row.sources + ["shuffled_memory"])),
+                    paths=row.paths + [f"shuffled_control_replacement:{replacement_mid}"],
+                    matched_evidence_terms=row.matched_evidence_terms,
+                ))
+            return shuffled
         return retrieved[:top_k]
 
     def to_dict(self) -> Dict[str, Any]:
@@ -3582,17 +3886,30 @@ def failure_lesson_passes_quality_gate_v2(
 def _format_compact_history_lines(items: List[Dict[str, Any]]) -> str:
     if not items:
         return "- No user history."
-    return "\n".join(
-        f"- title: {str(item.get('title', '')).strip() or 'Unknown'}; category: {str(item.get('category', 'Unknown')).strip() or 'Unknown'}"
-        for item in items[-10:]
-    )
+    lines = []
+    for item in items[-10:]:
+        desc = str(item.get("description", "")).strip()
+        suffix = f"; description: {desc}" if desc else ""
+        lines.append(
+            f"- title: {str(item.get('title', '')).strip() or 'Unknown'}; "
+            f"category: {str(item.get('category', 'Unknown')).strip() or 'Unknown'}"
+            f"{suffix}"
+        )
+    return "\n".join(lines)
 
 
 def _format_compact_candidate_lines(items: List[Dict[str, Any]]) -> str:
-    return "\n".join(
-        f"- candidate_id: {item.get('candidate_id')}, title: {str(item.get('title', '')).strip() or 'Unknown'}, category: {str(item.get('category', 'Unknown')).strip() or 'Unknown'}"
-        for item in items
-    )
+    lines = []
+    for item in items:
+        desc = str(item.get("description", "")).strip()
+        suffix = f", description: {desc}" if desc else ""
+        lines.append(
+            f"- candidate_id: {item.get('candidate_id')}, "
+            f"title: {str(item.get('title', '')).strip() or 'Unknown'}, "
+            f"category: {str(item.get('category', 'Unknown')).strip() or 'Unknown'}"
+            f"{suffix}"
+        )
+    return "\n".join(lines)
 
 
 def build_compact_score_prompt(
@@ -3702,6 +4019,7 @@ Rules:
             role_prompt="You summarize user preference evidence for a recommender system.",
             max_new_tokens=700,
             json_mode=True,
+            call_type="user_memory_init",
         )
         parsed = extract_json_object(raw)
         profile = str(parsed.get("profile") or "").strip()
@@ -3813,6 +4131,7 @@ Rules:
             role_prompt="You extract reusable failure-correction memories for recommendation.",
             max_new_tokens=900,
             json_mode=True,
+            call_type="failure_lesson",
         )
         parsed = extract_json_object(raw)
         lesson_text = str(parsed.get("lesson") or "").strip()
@@ -3909,6 +4228,9 @@ def read_graph_lessons_as_facets_v2(
     candidate_items: List[Dict[str, Any]],
     retrieved_lessons: List[GraphRetrievedLesson],
     trace_context: Optional[Dict[str, Any]] = None,
+    max_memory_facts: int = 3,
+    max_memory_fact_words: int = 55,
+    memory_token_budget: int = 420,
 ) -> Dict[str, Any]:
     """Select safe factual memory snippets without another LLM call.
 
@@ -3937,7 +4259,7 @@ def read_graph_lessons_as_facets_v2(
     )
     candidate_text = _context_text_from_items(candidate_items)
 
-    used_facts: List[str] = []
+    candidate_fact_rows: List[Tuple[str, Dict[str, Any]]] = []
     used_ids: List[str] = []
     rejected: List[Dict[str, Any]] = []
     selected_rows: List[Dict[str, Any]] = []
@@ -4016,14 +4338,32 @@ def read_graph_lessons_as_facets_v2(
 
         if accept:
             used_ids.append(lesson.memory_id)
-            used_facts.append(lesson.safe_fact())
+            safe_fact = lesson.safe_fact()
+            candidate_fact_rows.append((safe_fact, row))
             row["accept_reason"] = reason
             selected_rows.append(row)
+            memory_system.memory_diagnostics["selected_memory_facts_total"] += 1
+            if has_metadata_noise(safe_fact):
+                memory_system.memory_diagnostics["selected_memory_facts_noisy"] += 1
+            for source in r.sources:
+                memory_system.memory_diagnostics[f"selected_source_{source}"] += 1
         else:
             row["reject_reason"] = reason
             rejected.append(row)
-        if len(used_facts) >= 3:
+            memory_system.memory_diagnostics["rejected_memory_facts_total"] += 1
+            for source in r.sources:
+                memory_system.memory_diagnostics[f"rejected_source_{source}"] += 1
+        if max_memory_facts > 0 and len(candidate_fact_rows) >= max_memory_facts * 2:
+            # Keep a small overflow buffer for token-budget packing.
             break
+
+    used_facts, packing_audit = pack_memory_facts(
+        candidate_fact_rows,
+        max_facts=max_memory_facts,
+        max_words=max_memory_fact_words,
+        token_budget=memory_token_budget,
+    )
+    used_ids = [row.get("memory_id", "") for row in packing_audit if row.get("pack_decision") == "keep"]
 
     result = {
         "use_memory": bool(used_facts),
@@ -4042,6 +4382,10 @@ def read_graph_lessons_as_facets_v2(
         "rejected_rows": rejected,
         "retrieved_graph_lessons": all_rows,
         "history_profile_text": history_profile_text[:2000],
+        "packing_audit": packing_audit,
+        "max_memory_facts": max_memory_facts,
+        "max_memory_fact_words": max_memory_fact_words,
+        "memory_token_budget": memory_token_budget,
     })
     return result
 
@@ -4056,7 +4400,12 @@ def llm_ranking_v2(
     trace_context: Optional[Dict[str, Any]] = None,
 ) -> List[str]:
     candidate_info = [
-        {"item_id": str(item["item_id"]), "title": item["title"], "category": item["category"]}
+        {
+            "item_id": str(item["item_id"]),
+            "title": item["title"],
+            "category": item["category"],
+            "description": item.get("description", ""),
+        }
         for item in candidate_items
     ]
     aliased_candidates, alias_to_item_id = add_candidate_aliases(candidate_info)
@@ -4178,6 +4527,7 @@ JSON format:
                 max_new_tokens=int(os.getenv("MEMCF_RANK_MAX_TOKENS", "1400")),
                 json_schema=score_json_schema,
                 json_mode=True,
+                call_type="ranking",
             )
             try:
                 result = extract_json_object(raw_response)
@@ -4391,6 +4741,10 @@ def evaluate_user_v2(
     max_negative_candidates: Optional[int] = None,
     no_harm_arbitration: bool = False,
     ranking_prompt_style: str = "memcf",
+    graph_retrieval_scope: str = "full",
+    max_memory_facts: int = 3,
+    max_memory_fact_words: int = 55,
+    memory_token_budget: int = 420,
 ) -> Tuple[Dict[str, float], Dict[str, float], List[str], List[str], List[str]]:
     if eval_type == "val":
         ground_truth = [str(x) for x in user_data.get("val", [])]
@@ -4429,6 +4783,8 @@ def evaluate_user_v2(
             top_k=graph_memory_k,
             neighbor_k=neighbor_k,
             min_evidence_terms=min_evidence_terms,
+            retrieval_scope=graph_retrieval_scope,
+            shuffle_salt=f"{eval_type}:{user_id}:{','.join(candidates)}",
         )
         memory_system.record_memory_diagnostics(
             retrieved=len(retrieved_graph_lessons),
@@ -4460,7 +4816,10 @@ def evaluate_user_v2(
             train_items=train_items_info,
             candidate_items=candidate_items_info,
             retrieved_lessons=retrieved_graph_lessons,
-            trace_context={"user_id": user_id, "eval_type": eval_type},
+            trace_context={"user_id": user_id, "eval_type": eval_type, "graph_retrieval_scope": graph_retrieval_scope},
+            max_memory_facts=max_memory_facts,
+            max_memory_fact_words=max_memory_fact_words,
+            memory_token_budget=memory_token_budget,
         )
 
     memory_facets = memory_reader_result.get("facets", []) if memory_reader_result.get("use_memory") else []
@@ -4587,7 +4946,19 @@ def parse_args_v2():
     parser.add_argument("--max_positive_interactions", type=int, default=5)
     parser.add_argument("--max_negative_candidates", type=int, default=19)
     parser.add_argument("--graph_memory_k", type=int, default=3)
+    parser.add_argument(
+        "--k_memories",
+        type=int,
+        default=None,
+        help="Legacy alias for --graph_memory_k.",
+    )
     parser.add_argument("--neighbor_k", type=int, default=10)
+    parser.add_argument(
+        "--memory_retrieval_mode",
+        type=str,
+        default="graph",
+        help="Legacy compatibility flag. Only graph retrieval is supported by the v2 runner.",
+    )
     parser.add_argument("--min_evidence_terms", type=int, default=1)
     parser.add_argument("--no_harm_arbitration", action="store_true", default=False)
     parser.add_argument("--candidate_negative_mode", type=str, default="candidate_hard",
@@ -4596,11 +4967,39 @@ def parse_args_v2():
     parser.add_argument("--max_lesson_risk", type=float, default=0.85)
     parser.add_argument("--max_failure_lessons_per_user", type=int, default=3)
     parser.add_argument("--ranking_prompt_style", type=str, default="compact_score",
-                        choices=["memcf", "compact_score"])
+                        choices=["memcf", "compact_score", "memrec_old"])
+    parser.add_argument("--graph_retrieval_scope", type=str, default="full",
+                        choices=["full", "same_user", "candidate_item", "history_item", "neighbor_user", "random_memory", "shuffled_memory"],
+                        help="Failure-graph retrieval ablation scope. Distinct from MemRec neighbor pruning.")
+    parser.add_argument("--max_memory_facts", type=int, default=3)
+    parser.add_argument("--max_memory_fact_words", type=int, default=55)
+    parser.add_argument("--memory_token_budget", type=int, default=420)
+    parser.add_argument("--phase", type=str, default="all", choices=["all", "train_only", "eval_only"])
+    parser.add_argument("--memory_file", type=str, default=None, help="Optional explicit memory artifact path for train/eval reuse.")
+    parser.add_argument("--artifact_root", type=str, default=None, help="Optional artifact root for failure-graph memory files.")
+    parser.add_argument("--user_shard_id", type=int, default=0)
+    parser.add_argument("--num_user_shards", type=int, default=1)
+    parser.add_argument("--run_name_suffix", type=str, default="")
     parser.add_argument("--trace_dir", type=str, default=None)
     parser.add_argument("--disable_trace", action="store_false", dest="trace_enabled")
     parser.set_defaults(trace_enabled=True)
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    if args.k_memories is not None:
+        args.graph_memory_k = args.k_memories
+
+    retrieval_mode = str(args.memory_retrieval_mode).strip().lower()
+    if retrieval_mode not in {"graph", "graph_only", "fail_graph"}:
+        raise ValueError(
+            "MEMCF v2 only supports graph retrieval. "
+            f"Received --memory_retrieval_mode={args.memory_retrieval_mode}."
+        )
+    args.memory_retrieval_mode = "graph"
+
+    if args.ranking_prompt_style == "memrec_old":
+        args.ranking_prompt_style = "memcf"
+
+    return args
 
 
 def save_v2_memory(path: str, graph: MemoryGraphIndex, user_profiles: Dict[str, UserMemoryProfile]) -> None:
@@ -4628,6 +5027,8 @@ def load_v2_memory(path: str, user_sequences: Dict[str, Dict[str, Any]]) -> Tupl
 
 
 def main_v2():
+    run_started_at = datetime.now()
+    run_start_time = time.time()
     args = parse_args_v2()
     random.seed(2020)
     np.random.seed(2020)
@@ -4643,10 +5044,22 @@ def main_v2():
     max_failure_lessons_per_user = args.max_failure_lessons_per_user
     ranking_prompt_style = args.ranking_prompt_style
 
-    base_dir = os.getenv("AGENTICREC_CFMEMORY_ROOT", os.path.dirname(os.path.abspath(__file__)))
-    data_root = os.getenv("AGENTICREC_DATA_ROOT", os.path.join(base_dir, "data"))
-    eval_root = os.getenv("AGENTICREC_EVAL_ROOT", os.path.join(base_dir, "evaluation_results"))
-    memory_root = os.getenv("AGENTICREC_MEMORY_ROOT", os.path.join(base_dir, "agent_memory"))
+    base_dir = os.getenv(
+        "MEMCF_ROOT",
+        os.getenv("AGENTICREC_CFMEMORY_ROOT", os.path.dirname(os.path.abspath(__file__))),
+    )
+    data_root = os.getenv(
+        "MEMCF_DATA_ROOT",
+        os.getenv("AGENTICREC_DATA_ROOT", os.path.join(base_dir, "data")),
+    )
+    eval_root = os.getenv(
+        "MEMCF_EVAL_ROOT",
+        os.getenv("AGENTICREC_EVAL_ROOT", os.path.join(base_dir, "evaluation_results")),
+    )
+    memory_root = os.getenv(
+        "MEMCF_MEMORY_ROOT",
+        os.getenv("AGENTICREC_MEMORY_ROOT", os.path.join(base_dir, "agent_memory")),
+    )
     data_dir = os.path.join(data_root, data_name)
     eval_dir = os.path.join(eval_root, data_name)
     memory_dir = os.path.join(memory_root, data_name)
@@ -4657,16 +5070,31 @@ def main_v2():
     sequences_path = os.path.join(data_dir, "user_sequences_10.json")
     negatives_path = os.path.join(data_dir, "user_negatives_10.json")
     items_meta, user_sequences, user_negatives = load_data(items_path, sequences_path, negatives_path)
-    user_ids = list(user_sequences.keys())[:number_of_users]
+    all_selected_user_ids = list(user_sequences.keys())[:number_of_users]
+    user_ids = stable_shard_filter(all_selected_user_ids, args.user_shard_id, args.num_user_shards)
     print(f"Total users loaded: {len(user_sequences)}")
-    print(f"MEMCF selected users: {len(user_ids)}")
+    print(f"MEMCF selected users before shard: {len(all_selected_user_ids)}")
+    print(f"MEMCF active users after shard {args.user_shard_id}/{args.num_user_shards}: {len(user_ids)}")
 
+    prompt_tag = slugify(ranking_prompt_style)
+    negative_tag = slugify(candidate_negative_mode)
+    quality_tag = (
+        f"conf{float_tag(min_lesson_confidence)}"
+        f"_risk{float_tag(max_lesson_risk)}"
+        f"_maxless{max_failure_lessons_per_user}"
+    )
+    no_harm_tag = "noharm1" if args.no_harm_arbitration else "noharm0"
+    scope_tag = slugify(args.graph_retrieval_scope)
+    pack_tag = f"mf{args.max_memory_facts}_mw{args.max_memory_fact_words}_tb{args.memory_token_budget}"
+    shard_tag = f"shard{args.user_shard_id}of{args.num_user_shards}" if args.num_user_shards > 1 else "fullusers"
+    suffix_tag = f"_{slugify(args.run_name_suffix)}" if args.run_name_suffix else ""
     run_name = (
-        f"memcf_graph_nuser{number_of_users}_iter{args.max_iterations}"
-        f"_gk{args.graph_memory_k}_nk{args.neighbor_k}_ev{args.min_evidence_terms}"
+        f"memcf_graph_nuser{number_of_users}_{shard_tag}_iter{args.max_iterations}"
+        f"_scope{scope_tag}_gk{args.graph_memory_k}_nk{args.neighbor_k}_ev{args.min_evidence_terms}"
+        f"_{no_harm_tag}_neg{negative_tag}_prompt{prompt_tag}_{quality_tag}_{pack_tag}{suffix_tag}"
     )
     if not use_memory:
-        run_name = f"memcf_nomemory_nuser{number_of_users}"
+        run_name = f"memcf_nomemory_nuser{number_of_users}_{shard_tag}_neg{negative_tag}_prompt{prompt_tag}{suffix_tag}"
 
     trace_dir = args.trace_dir or os.path.join(
         eval_dir,
@@ -4683,14 +5111,21 @@ def main_v2():
     user_states: Dict[str, PairwiseUserState] = {}
     graph = MemoryGraphIndex(user_sequences)
     user_profiles: Dict[str, UserMemoryProfile] = {}
-    memory_file_path = os.path.join(memory_dir, f"{run_name}.memory.json")
+    artifact_root = args.artifact_root or memory_dir
+    os.makedirs(artifact_root, exist_ok=True)
+    memory_file_path = args.memory_file or os.path.join(artifact_root, f"{run_name}.memory.json")
 
     if use_memory:
-        if args.LOAD_SAVED_MEMORY and os.path.exists(memory_file_path):
+        should_load_memory = (args.LOAD_SAVED_MEMORY or args.phase == "eval_only") and os.path.exists(memory_file_path)
+        if should_load_memory:
             print(f"Loading MEMCF graph memory from {memory_file_path}")
             graph, user_profiles = load_v2_memory(memory_file_path, user_sequences)
             for uid, profile in user_profiles.items():
                 user_states[uid] = PairwiseUserState(user_id=uid, short_term_memory=profile.profile)
+        elif args.phase == "eval_only":
+            raise FileNotFoundError(
+                f"MEMCF eval_only requires an existing memory file: {memory_file_path}"
+            )
         else:
             print("\n" + "=" * 80)
             print("PHASE 0: INITIALIZE USER MEMORY FROM HISTORY")
@@ -4739,6 +5174,17 @@ def main_v2():
                 print(f"  → Generated {len(lessons)} graph failure lessons")
             print(f"Total MEMCF graph lessons: {total_lessons}")
             save_v2_memory(memory_file_path, graph, user_profiles)
+            if args.phase == "train_only":
+                trace_recorder.write_manifest({
+                    "run_name": run_name,
+                    "memory_file": memory_file_path,
+                    "completed_at": datetime.now().isoformat(),
+                    "phase": args.phase,
+                    "num_graph_lessons": len(graph.lessons),
+                    "llm_usage": memory_system.get_llm_usage_summary(),
+                })
+                print("MEMCF train_only complete; skipping evaluation.")
+                return
     else:
         print("MEMCF no-memory run: skipping user-memory init and failure-memory training.")
 
@@ -4768,6 +5214,10 @@ def main_v2():
             max_negative_candidates=max_negative_candidates,
             no_harm_arbitration=args.no_harm_arbitration,
             ranking_prompt_style=ranking_prompt_style,
+            graph_retrieval_scope=args.graph_retrieval_scope,
+            max_memory_facts=args.max_memory_facts,
+            max_memory_fact_words=args.max_memory_fact_words,
+            memory_token_budget=args.memory_token_budget,
         )
         for metric_name, value in metrics.items():
             val_metrics[metric_name].append(value)
@@ -4785,7 +5235,7 @@ def main_v2():
     if use_memory:
         output_file = os.path.join(eval_dir, f"{run_name}.json")
     else:
-        output_file = os.path.join(eval_dir, "memcf_zeroshot_users_ranking_no_memory.json")
+        output_file = os.path.join(eval_dir, f"{run_name}.json")
     save_all_users_ranking_results(all_user_results, items_meta, output_file)
 
     print("\nValidation Results:")
@@ -4818,6 +5268,15 @@ def main_v2():
         "max_lesson_risk": max_lesson_risk,
         "max_failure_lessons_per_user": max_failure_lessons_per_user,
         "ranking_prompt_style": ranking_prompt_style,
+        "phase": args.phase,
+        "user_shard_id": args.user_shard_id,
+        "num_user_shards": args.num_user_shards,
+        "active_user_count": len(user_ids),
+        "graph_retrieval_scope": args.graph_retrieval_scope,
+        "max_memory_facts": args.max_memory_facts,
+        "max_memory_fact_words": args.max_memory_fact_words,
+        "memory_token_budget": args.memory_token_budget,
+        "artifact_root": artifact_root,
         "graph_memory_k": args.graph_memory_k,
         "neighbor_k": args.neighbor_k,
         "min_evidence_terms": args.min_evidence_terms,
@@ -4827,6 +5286,16 @@ def main_v2():
         "memory_file": memory_file_path if use_memory else None,
         "num_graph_lessons": len(graph.lessons),
         "num_user_profiles": len(user_profiles),
+        "runtime": {
+            "started_at": run_started_at.isoformat(),
+            "completed_at": datetime.now().isoformat(),
+            "total_seconds": time.time() - run_start_time,
+            "seconds_per_evaluated_user": (
+                (time.time() - run_start_time) / len(all_user_results)
+                if all_user_results else None
+            ),
+        },
+        "llm_usage": memory_system.get_llm_usage_summary(),
         "baseline_metrics": {
             metric: (float(np.mean(baseline_metrics[metric])) if baseline_metrics[metric] else None)
             for metric in ["recall@5", "recall@10", "recall@20", "ndcg@5", "ndcg@10", "ndcg@20"]
@@ -4851,6 +5320,29 @@ def main_v2():
             "no_harm_users": int(diag.get("no_harm_users", 0.0)),
             "no_harm_used_memory": int(diag.get("no_harm_used_memory", 0.0)),
             "no_harm_fallback_no_memory": int(diag.get("no_harm_fallback_no_memory", 0.0)),
+            "no_harm_memory_use_rate": (
+                float(diag.get("no_harm_used_memory", 0.0)) / float(diag.get("no_harm_users", 0.0))
+                if float(diag.get("no_harm_users", 0.0)) else 0.0
+            ),
+            "selected_memory_facts_total": int(diag.get("selected_memory_facts_total", 0.0)),
+            "rejected_memory_facts_total": int(diag.get("rejected_memory_facts_total", 0.0)),
+            "selected_memory_facts_noisy": int(diag.get("selected_memory_facts_noisy", 0.0)),
+            "selected_memory_facts_noise_rate": (
+                float(diag.get("selected_memory_facts_noisy", 0.0)) / float(diag.get("selected_memory_facts_total", 0.0))
+                if float(diag.get("selected_memory_facts_total", 0.0)) else 0.0
+            ),
+            "selected_source_same_user": int(diag.get("selected_source_same_user", 0.0)),
+            "selected_source_candidate_item": int(diag.get("selected_source_candidate_item", 0.0)),
+            "selected_source_history_item": int(diag.get("selected_source_history_item", 0.0)),
+            "selected_source_neighbor_user": int(diag.get("selected_source_neighbor_user", 0.0)),
+            "selected_source_random_memory": int(diag.get("selected_source_random_memory", 0.0)),
+            "selected_source_shuffled_memory": int(diag.get("selected_source_shuffled_memory", 0.0)),
+            "rejected_source_same_user": int(diag.get("rejected_source_same_user", 0.0)),
+            "rejected_source_candidate_item": int(diag.get("rejected_source_candidate_item", 0.0)),
+            "rejected_source_history_item": int(diag.get("rejected_source_history_item", 0.0)),
+            "rejected_source_neighbor_user": int(diag.get("rejected_source_neighbor_user", 0.0)),
+            "rejected_source_random_memory": int(diag.get("rejected_source_random_memory", 0.0)),
+            "rejected_source_shuffled_memory": int(diag.get("rejected_source_shuffled_memory", 0.0)),
         },
     }
     summary_file = output_file.replace(".json", ".summary.json")

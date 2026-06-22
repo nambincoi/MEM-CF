@@ -74,7 +74,10 @@ MEMCF/
 ├── scripts/
 │   ├── run_smoke.sh                  # 5-user smoke test
 │   ├── run_ablation_one_dataset.sh   # Run one dataset and one ablation variant
-│   ├── run_16_ablation_jobs.sh       # Launch 4 datasets x 4 variants in parallel
+│   ├── run_ablation_jobs.sh          # Launch configurable parallel ablation jobs
+│   ├── run_16_ablation_jobs.sh       # Launch compact 4 datasets x 4 variants protocol
+│   ├── merge_memory_shards.py        # Merge train-only memory shards for 1K-user runs
+│   ├── aggregate_paper_tables.py     # Aggregate metrics/cost/runtime summaries
 │   └── compare_memory_vs_nomemory.py # Paired significance test for ranking JSONs
 ├── docs/
 │   ├── DATA_FORMAT.md                # Expected runtime data format
@@ -218,6 +221,43 @@ python -m memcf \
 
 ### Current Default Research Settings
 
+The current paper-oriented ablations are:
+
+| Variant | Meaning |
+| --- | --- |
+| `A0_no_memory` | LLM ranker with no memory. |
+| `A1_same_user_only` | Only target-user failure lessons. |
+| `A2_candidate_item_only` | Only lessons attached to current candidate items. |
+| `A3_neighbor_user_only` | Only cross-user lessons reached through shared-history items. |
+| `A4_full_graph` | Same-user + candidate-item + history-item + neighbor-user paths. |
+| `A5_full_graph_noharm` | Full graph with no-harm fallback to no-memory ranking. |
+| `A6_random_memory` | Random memory control. |
+| `A7_shuffled_memory` | Shuffled real-memory control. |
+
+The default memory packer injects at most 3 short failure facts, 55 words each, with an estimated memory-token budget of 420. The structured memory object remains richer than the text passed to the ranker; this keeps the ranker prompt short while preserving traceability.
+
+Run the compact 4-dataset x 4-variant protocol:
+
+```bash
+bash scripts/run_16_ablation_jobs.sh
+```
+
+Run the full 4-dataset x 8-variant protocol:
+
+```bash
+VARIANTS="A0_no_memory A1_same_user_only A2_candidate_item_only A3_neighbor_user_only A4_full_graph A5_full_graph_noharm A6_random_memory A7_shuffled_memory" bash scripts/run_ablation_jobs.sh
+```
+
+Create a metrics/cost table:
+
+```bash
+python scripts/aggregate_paper_tables.py   --root "$MEMCF_EVAL_ROOT"   --csv "$MEMCF_EVAL_ROOT/paper_table.csv"   --markdown "$MEMCF_EVAL_ROOT/paper_table.md"
+```
+
+See [docs/ABLATIONS.md](docs/ABLATIONS.md) for sharded 1K-user runs and reporting details.
+
+## Current Default Research Settings
+
 The scripts default to the strongest current MEMCF configuration:
 
 | Option | Default | Purpose |
@@ -247,11 +287,13 @@ Run one dataset and one variant:
 bash scripts/run_ablation_one_dataset.sh Video_Game A2_safe_graph_noharm
 ```
 
-Launch all 16 jobs for 4 datasets x 4 variants:
+Launch the default 12 jobs for 3 datasets x 4 variants:
 
 ```bash
 bash scripts/run_16_ablation_jobs.sh
 ```
+
+The default datasets are `Video_Game`, `Digital_Music_1000u`, and `All_Beauty_1000u`. `CDs_and_Vinyl_1000u` is intentionally not part of the default paper run because prior traces showed noisy metadata and weaker memory transfer; add it back to `scripts/run_16_ablation_jobs.sh` only for stress testing.
 
 The script writes PIDs to `$MEMCF_EVAL_ROOT/_pids/`.
 
@@ -270,6 +312,7 @@ Important trace files:
 | `global_memory_added.jsonl` | Lesson inserted into global memory graph. |
 | `graph_memory_retrieval.jsonl` | Retrieved memory facts for each evaluation user. |
 | `memory_facts_selected.jsonl` | Final short facts injected into the prompt. |
+| `llm_call.jsonl` | Per-call accounting for prompt/completion tokens, seconds, errors, and call type. |
 | `ranking_llm.jsonl` | Full ranking prompt and LLM response. |
 | `ranking_result.jsonl` | Parsed ranking and metrics per user. |
 | `no_harm_arbitration.jsonl` | Arbitration decision when enabled. |
@@ -292,8 +335,12 @@ When reporting MEMCF results, always include:
 - whether memory was enabled
 - graph memory parameters: `graph_memory_k`, `neighbor_k`, `min_evidence_terms`
 - whether no-harm arbitration was enabled
+- total runtime and seconds per evaluated user
+- LLM calls, prompt tokens, completion tokens, total tokens, and call-type breakdown
 - local model name and endpoint
 - trace directory for auditability
+
+Each summary JSON contains `runtime`, `llm_usage`, `memory_diagnostics`, `metrics`, and `baseline_metrics`. These fields should be used for paper tables on quality, efficiency, and cost.
 
 ## Reproducibility Notes
 
@@ -303,6 +350,7 @@ LLM reranking is sensitive to model server settings, prompt formatting, token li
 - use the same user subset for all variants
 - use temperature `0.0` when supported by the endpoint
 - save raw ranking JSON and JSONL traces
+- record LLM call counts, tokens, and wall-clock runtime
 - compare no-memory and memory variants on the same data split
 - report parsing failures and skipped users
 

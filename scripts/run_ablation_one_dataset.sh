@@ -24,64 +24,80 @@ MAX_ITER="${MAX_ITERATIONS:-1}"
 NEIGHBOR_K="${NEIGHBOR_K:-10}"
 MIN_EVIDENCE="${MIN_EVIDENCE_TERMS:-1}"
 RANKING_PROMPT_STYLE="${RANKING_PROMPT_STYLE:-compact_score}"
+MAX_MEMORY_FACTS="${MAX_MEMORY_FACTS:-3}"
+MAX_MEMORY_FACT_WORDS="${MAX_MEMORY_FACT_WORDS:-55}"
+MEMORY_TOKEN_BUDGET="${MEMORY_TOKEN_BUDGET:-420}"
+GRAPH_MEMORY_K="${GRAPH_MEMORY_K:-3}"
+CANDIDATE_NEGATIVE_MODE="${CANDIDATE_NEGATIVE_MODE:-candidate_hard}"
+PHASE="${PHASE:-all}"
 
 mkdir -p "$MEMCF_EVAL_ROOT/$DATASET/logs"
 LOG="$MEMCF_EVAL_ROOT/$DATASET/logs/${VARIANT}_nuser${N_USERS}.log"
 
+COMMON_ARGS=(
+  --data_name "$DATASET"
+  --number_of_users "$N_USERS"
+  --max_positive_interactions "$MAX_POS"
+  --max_negative_candidates "$MAX_NEG"
+  --ranking_prompt_style "$RANKING_PROMPT_STYLE"
+  --candidate_negative_mode "$CANDIDATE_NEGATIVE_MODE"
+  --phase "$PHASE"
+)
+
+MEMORY_ARGS=(
+  --use_memory
+  --max_iterations "$MAX_ITER"
+  --graph_memory_k "$GRAPH_MEMORY_K"
+  --neighbor_k "$NEIGHBOR_K"
+  --min_evidence_terms "$MIN_EVIDENCE"
+  --max_memory_facts "$MAX_MEMORY_FACTS"
+  --max_memory_fact_words "$MAX_MEMORY_FACT_WORDS"
+  --memory_token_budget "$MEMORY_TOKEN_BUDGET"
+)
+
+EXTRA_ARGS=()
+[ -n "${MEMORY_FILE:-}" ] && EXTRA_ARGS+=(--memory_file "$MEMORY_FILE")
+[ -n "${ARTIFACT_ROOT:-}" ] && EXTRA_ARGS+=(--artifact_root "$ARTIFACT_ROOT")
+[ -n "${USER_SHARD_ID:-}" ] && EXTRA_ARGS+=(--user_shard_id "$USER_SHARD_ID")
+[ -n "${NUM_USER_SHARDS:-}" ] && EXTRA_ARGS+=(--num_user_shards "$NUM_USER_SHARDS")
+[ -n "${RUN_NAME_SUFFIX:-}" ] && EXTRA_ARGS+=(--run_name_suffix "$RUN_NAME_SUFFIX")
+[ "${LOAD_SAVED_MEMORY:-0}" = "1" ] && EXTRA_ARGS+=(--LOAD_SAVED_MEMORY)
+[ "${DISABLE_TRACE:-0}" = "1" ] && EXTRA_ARGS+=(--disable_trace)
+
 case "$VARIANT" in
   A0_no_memory)
-    ARGS=(
-      --data_name "$DATASET"
-      --number_of_users "$N_USERS"
-      --no_use_memory
-      --max_positive_interactions "$MAX_POS"
-      --max_negative_candidates "$MAX_NEG"
-      --ranking_prompt_style "$RANKING_PROMPT_STYLE"
-    )
+    ARGS=("${COMMON_ARGS[@]}" --no_use_memory)
     ;;
+  A1_same_user_only)
+    ARGS=("${COMMON_ARGS[@]}" "${MEMORY_ARGS[@]}" --graph_retrieval_scope same_user)
+    ;;
+  A2_candidate_item_only)
+    ARGS=("${COMMON_ARGS[@]}" "${MEMORY_ARGS[@]}" --graph_retrieval_scope candidate_item)
+    ;;
+  A3_neighbor_user_only)
+    ARGS=("${COMMON_ARGS[@]}" "${MEMORY_ARGS[@]}" --graph_retrieval_scope neighbor_user)
+    ;;
+  A4_full_graph)
+    ARGS=("${COMMON_ARGS[@]}" "${MEMORY_ARGS[@]}" --graph_retrieval_scope full)
+    ;;
+  A5_full_graph_noharm)
+    ARGS=("${COMMON_ARGS[@]}" "${MEMORY_ARGS[@]}" --graph_retrieval_scope full --no_harm_arbitration)
+    ;;
+  A6_random_memory)
+    ARGS=("${COMMON_ARGS[@]}" "${MEMORY_ARGS[@]}" --graph_retrieval_scope random_memory)
+    ;;
+  A7_shuffled_memory)
+    ARGS=("${COMMON_ARGS[@]}" "${MEMORY_ARGS[@]}" --graph_retrieval_scope shuffled_memory)
+    ;;
+  # Backward-compatible names from earlier runs.
   A1_safe_graph_no_noharm)
-    ARGS=(
-      --data_name "$DATASET"
-      --number_of_users "$N_USERS"
-      --use_memory
-      --max_iterations "$MAX_ITER"
-      --max_positive_interactions "$MAX_POS"
-      --max_negative_candidates "$MAX_NEG"
-      --ranking_prompt_style "$RANKING_PROMPT_STYLE"
-      --graph_memory_k 3
-      --neighbor_k "$NEIGHBOR_K"
-      --min_evidence_terms "$MIN_EVIDENCE"
-    )
+    ARGS=("${COMMON_ARGS[@]}" "${MEMORY_ARGS[@]}" --graph_retrieval_scope full)
     ;;
   A2_safe_graph_noharm)
-    ARGS=(
-      --data_name "$DATASET"
-      --number_of_users "$N_USERS"
-      --use_memory
-      --max_iterations "$MAX_ITER"
-      --max_positive_interactions "$MAX_POS"
-      --max_negative_candidates "$MAX_NEG"
-      --ranking_prompt_style "$RANKING_PROMPT_STYLE"
-      --graph_memory_k 3
-      --neighbor_k "$NEIGHBOR_K"
-      --min_evidence_terms "$MIN_EVIDENCE"
-      --no_harm_arbitration
-    )
+    ARGS=("${COMMON_ARGS[@]}" "${MEMORY_ARGS[@]}" --graph_retrieval_scope full --no_harm_arbitration)
     ;;
   A3_safe_graph_k5_noharm)
-    ARGS=(
-      --data_name "$DATASET"
-      --number_of_users "$N_USERS"
-      --use_memory
-      --max_iterations "$MAX_ITER"
-      --max_positive_interactions "$MAX_POS"
-      --max_negative_candidates "$MAX_NEG"
-      --ranking_prompt_style "$RANKING_PROMPT_STYLE"
-      --graph_memory_k 5
-      --neighbor_k "$NEIGHBOR_K"
-      --min_evidence_terms "$MIN_EVIDENCE"
-      --no_harm_arbitration
-    )
+    ARGS=("${COMMON_ARGS[@]}" "${MEMORY_ARGS[@]}" --graph_retrieval_scope full --graph_memory_k 5 --no_harm_arbitration)
     ;;
   *)
     echo "Unknown variant: $VARIANT" >&2
@@ -89,7 +105,10 @@ case "$VARIANT" in
     ;;
 esac
 
+ARGS+=("${EXTRA_ARGS[@]}")
+
 echo "Dataset: $DATASET"
 echo "Variant: $VARIANT"
 echo "Log: $LOG"
+echo "Args: ${ARGS[*]}"
 python -m memcf "${ARGS[@]}" 2>&1 | tee "$LOG"
