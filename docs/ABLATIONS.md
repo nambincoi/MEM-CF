@@ -21,6 +21,28 @@ The terminology is intentionally MEMCF-specific:
 | `A5_full_graph_noharm` | Full graph plus no-harm arbitration. This is the recommended main MEMCF setting if it beats A4. |
 | `A6_random_memory` | Random memory control. If this is close to full graph, memory content is not well targeted. |
 | `A7_shuffled_memory` | Shuffled-memory control with real memory text but mismatched to users/candidates. Tests whether retrieval path matters. |
+| `A8_profile_only` | Initializes/loads user profiles but disables graph-memory retrieval. Tests whether profile/context alone explains gains. |
+
+## Main-Paper Ablation Set
+
+Use this compact set when comparing against MemRec-style coarse module ablations:
+
+| Variant | Role |
+| --- | --- |
+| `A0_no_memory` | Vanilla LLM reranker over user history and candidates. |
+| `A8_profile_only` | User profile context without graph failure memories. |
+| `A1_same_user_only` | Personalized failure memory only. |
+| `A4_full_graph` | Main MEMCF graph retrieval. |
+| `A5_full_graph_noharm` | Main graph retrieval with no-harm arbitration. |
+| `A7_shuffled_memory` | Wrong-context real-memory control. |
+
+Keep these for appendix/stress tests:
+
+| Variant | Role |
+| --- | --- |
+| `A2_candidate_item_only` | Candidate-item path contribution. |
+| `A3_neighbor_user_only` | Cross-user/neighbor path contribution. |
+| `A6_random_memory` | Any-text random memory control. |
 
 Backward-compatible variant names are still accepted:
 
@@ -87,6 +109,39 @@ DATASETS="Video_Game Digital_Music_1000u" \
 VARIANTS="A0_no_memory A1_same_user_only A2_candidate_item_only A3_neighbor_user_only A4_full_graph A5_full_graph_noharm A6_random_memory A7_shuffled_memory" \
 bash scripts/run_ablation_jobs.sh
 ```
+
+## Train Once, Evaluate Main-Paper Ablations
+
+The main memory variants share the same offline memory construction. To avoid
+training the same failure graph repeatedly, train one memory file per dataset
+and reuse it for all evaluation ablations.
+
+Train shared memory files:
+
+```bash
+N_USERS=100 \
+MEMCF_EVAL_ROOT=/path/to/eval_root \
+MEMCF_MEMORY_ROOT=/path/to/memory_root \
+bash scripts/run_mainpaper_train_memory_jobs.sh
+```
+
+Evaluate the compact main-paper ablation set from the saved memory:
+
+```bash
+N_USERS=100 \
+MEMCF_EVAL_ROOT=/path/to/eval_root \
+MEMCF_MEMORY_ROOT=/path/to/memory_root \
+bash scripts/run_mainpaper_eval_jobs.sh
+```
+
+The default evaluated variants are:
+
+```text
+A0_no_memory A8_profile_only A1_same_user_only A4_full_graph A5_full_graph_noharm A7_shuffled_memory
+```
+
+If the memory file already exists, `run_mainpaper_train_memory_jobs.sh` skips
+training by default. Set `FORCE_RETRAIN=1` to rebuild it.
 
 ## 1K-User Sharded Workflow
 

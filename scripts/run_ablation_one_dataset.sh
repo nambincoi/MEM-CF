@@ -32,7 +32,15 @@ CANDIDATE_NEGATIVE_MODE="${CANDIDATE_NEGATIVE_MODE:-candidate_hard}"
 PHASE="${PHASE:-all}"
 
 mkdir -p "$MEMCF_EVAL_ROOT/$DATASET/logs"
-LOG="$MEMCF_EVAL_ROOT/$DATASET/logs/${VARIANT}_nuser${N_USERS}.log"
+LOG_TAG="${VARIANT}_nuser${N_USERS}"
+if [ -n "${NUM_USER_SHARDS:-}" ] && [ "${NUM_USER_SHARDS:-1}" != "1" ]; then
+  LOG_TAG="${LOG_TAG}_shard${USER_SHARD_ID:-0}of${NUM_USER_SHARDS}"
+fi
+if [ -n "${RUN_NAME_SUFFIX:-}" ]; then
+  SAFE_SUFFIX=$(printf "%s" "$RUN_NAME_SUFFIX" | tr -c 'A-Za-z0-9_.-' '_')
+  LOG_TAG="${LOG_TAG}_${SAFE_SUFFIX}"
+fi
+LOG="$MEMCF_EVAL_ROOT/$DATASET/logs/${LOG_TAG}.log"
 
 COMMON_ARGS=(
   --data_name "$DATASET"
@@ -88,6 +96,9 @@ case "$VARIANT" in
     ;;
   A7_shuffled_memory)
     ARGS=("${COMMON_ARGS[@]}" "${MEMORY_ARGS[@]}" --graph_retrieval_scope shuffled_memory)
+    ;;
+  A8_profile_only)
+    ARGS=("${COMMON_ARGS[@]}" "${MEMORY_ARGS[@]}" --profile_only)
     ;;
   # Backward-compatible names from earlier runs.
   A1_safe_graph_no_noharm)
