@@ -35,6 +35,19 @@ def latest_trace(dataset_dir: Path, variant: str):
     return max(matches, key=lambda p: p.stat().st_mtime) if matches else None
 
 
+def trace_from_summary(dataset_dir: Path, summary: dict, variant: str):
+    """Prefer the recorded trace path because long run names may be hashed."""
+    recorded = summary.get("trace_dir")
+    if recorded:
+        path = Path(recorded)
+        if path.exists():
+            return path
+        local = dataset_dir / "traces" / path.name
+        if local.exists():
+            return local
+    return latest_trace(dataset_dir, variant)
+
+
 def bootstrap_ci(values, samples=10000):
     if not values: return None
     rng = random.Random(20260713); n = len(values)
@@ -49,7 +62,7 @@ def main():
         for sp in ds.glob("*.summary.json"):
             variant = variant_from_name(sp.name)
             if not variant: continue
-            summary = json.load(sp.open()); trace = latest_trace(ds, variant)
+            summary = json.load(sp.open()); trace = trace_from_summary(ds, summary, variant)
             ranking = {}
             if trace:
                 ranking = {str(r.get("user_id")): r for r in read_jsonl(trace / "ranking_result.jsonl")}

@@ -6458,6 +6458,12 @@ JSON format:
 
     max_retries = int(os.getenv("MEMCF_RANK_RETRIES", "1"))
     current_prompt = prompt
+    base_cache_path = None
+    if ranking_score_cache_dir:
+        base_cache_key = hashlib.sha256(
+            (ranking_prompt_style + "\n" + prompt).encode("utf-8")
+        ).hexdigest()
+        base_cache_path = os.path.join(ranking_score_cache_dir, f"{base_cache_key}.json")
     for attempt in range(max_retries + 1):
         try:
             cache_path = None
@@ -6469,12 +6475,16 @@ JSON format:
                 cache_path = os.path.join(ranking_score_cache_dir, f"{cache_key}.json")
                 if os.path.isfile(cache_path):
                     with open(cache_path, "r", encoding="utf-8") as cache_file:
-                        raw_response = str(json.load(cache_file)["raw_response"])
-                    memory_system._trace("ranking_score_cache_hit", {
-                        **(trace_context or {}),
-                        "cache_path": cache_path,
-                        "prompt_hash": cache_key,
-                    })
+                        cached = json.load(cache_file)
+                    # Legacy cache entries may contain malformed first-attempt
+                    # responses. Only replay outputs that passed validation.
+                    if cached.get("is_valid") is True:
+                        raw_response = str(cached["raw_response"])
+                        memory_system._trace("ranking_score_cache_hit", {
+                            **(trace_context or {}),
+                            "cache_path": cache_path,
+                            "prompt_hash": cache_key,
+                        })
             if raw_response is None:
                 raw_response = memory_system.qwen_generate(
                     prompt=current_prompt,
@@ -6487,12 +6497,6 @@ JSON format:
                     json_mode=True,
                     call_type="ranking",
                 )
-                if cache_path:
-                    os.makedirs(ranking_score_cache_dir, exist_ok=True)
-                    tmp_path = f"{cache_path}.{os.getpid()}.tmp"
-                    with open(tmp_path, "w", encoding="utf-8") as cache_file:
-                        json.dump({"raw_response": raw_response}, cache_file, ensure_ascii=False)
-                    os.replace(tmp_path, cache_path)
             try:
                 result = extract_json_object(raw_response)
                 raw_scores = result.get("scores", [])
@@ -6568,6 +6572,19 @@ JSON format:
                 "memory_facts": facets,
                 "use_graph_memory_facts": bool(facets),
             })
+            if validation["is_valid"] and base_cache_path:
+                # Cache the final valid response under the original prompt key.
+                # This makes replay variants exactly paired even when the base
+                # run needed a repair prompt on an earlier attempt.
+                os.makedirs(ranking_score_cache_dir, exist_ok=True)
+                tmp_path = f"{base_cache_path}.{os.getpid()}.tmp"
+                with open(tmp_path, "w", encoding="utf-8") as cache_file:
+                    json.dump(
+                        {"raw_response": raw_response, "is_valid": True},
+                        cache_file,
+                        ensure_ascii=False,
+                    )
+                os.replace(tmp_path, base_cache_path)
             if validation["is_valid"] or attempt >= max_retries:
                 return ranked_ids
             current_prompt = f"""{prompt}
