@@ -10,6 +10,8 @@ __pycache__/
 .venv/
 .env
 .env.local
+.deploy_keys/
+*.bak*
 
 # Runtime data and outputs
 data/*

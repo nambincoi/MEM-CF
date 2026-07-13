@@ -196,3 +196,73 @@ python scripts/aggregate_paper_tables.py \
   --csv "$MEMCF_EVAL_ROOT/paper_table.csv" \
   --markdown "$MEMCF_EVAL_ROOT/paper_table.md"
 ```
+
+## Cluster Retrieval Ablations
+
+These variants test a reviewer-friendly alternative to hand-weighted graph path scoring. The memory store is unchanged: BINRec still stores failure-derived lessons with user/item provenance. The retrieval prior changes from mixed graph-path scoring to deterministic user clusters built from training-item overlap.
+
+Cluster v2 is intentionally additive. The main safe full-graph setting (`A4_full_graph`) is unchanged and can be evaluated in the same output root as a reference. Cluster v2 differs from the first cluster attempt in three ways:
+
+- Clusters are anchored by users that actually have failure memories, then all users are assigned to the nearest anchor.
+- Cluster peers are filtered to users with available memories, avoiding empty cluster retrieval.
+- Hybrid variants keep the strong original graph paths and add cluster-neighbor memories instead of replacing the original graph.
+
+| Variant | Meaning |
+| --- | --- |
+| `A9_cluster_user` | Retrieve failure lessons from users in the same item-overlap cluster only. |
+| `A10_cluster_full` | Retrieve same-user, candidate-item, and same-cluster failure lessons. |
+| `A11_random_cluster` | Random-memory control for the cluster setting. |
+| `A12_shuffled_cluster` | Uses real cluster/path retrieval shape but replaces retrieved lessons with mismatched lessons. |
+| `A13_cluster_full_noharm` | `A10_cluster_full` plus no-harm arbitration. |
+| `A14_hybrid_cluster` | Original full graph plus same-cluster memory neighbors. |
+| `A15_hybrid_cluster_strict` | `A14_hybrid_cluster` with strict candidate applicability and wrong-only rejection. |
+| `A16_cluster_user_fixed` | Cluster-user-only retrieval with memory-source cluster anchors and wrong-only rejection. |
+| `A17_cluster_full_fixed` | Cluster-user plus same-user/candidate-item paths with memory-source anchors and wrong-only rejection. |
+
+Cluster count defaults to `sqrt(number_of_users)` capped at 50 and can be overridden with:
+
+```bash
+export MEMCF_USER_CLUSTER_COUNT=20
+```
+
+Run cluster eval-only with existing main-paper memories:
+
+```bash
+export MEMCF_MEMORY_ROOT=/path/to/agent_memory_memcf_mainpaper_100u
+export MEMCF_EVAL_ROOT=/path/to/evaluation_results_memcf_cluster_eval
+bash scripts/run_cluster_eval_jobs.sh
+```
+
+Summaries now include `memory_artifact` with memory file size, lesson count, user-profile count, cluster count, and memory edge counts. `scripts/aggregate_paper_tables.py` exposes these fields as table columns.
+
+## D: Typed Failure Constraints
+
+The D family is additive and leaves all A/B/C behavior available. It keeps
+preferred, wrong, and history-context lesson edges separate, scores candidates
+with the clean profile/history prompt, and then reorders only tied or near-tied
+candidates using exact failure-edge evidence. No additive alpha/beta score is
+used.
+
+| Variant | Meaning |
+| --- | --- |
+| `D0_profile_base` | Strong clean base with the saved user profile but no retrieved failure lesson. |
+| `D1_same_user_exact` | Exact preferred/wrong edges from the target user's own failures. |
+| `D2_cross_user_exact` | Exact preferred/wrong edges from other users only. |
+| `D3_full_partitioned` | Same-user and cross-user evidence retained in separate branches. |
+| `D4_full_consensus` | D3 with a minimum number of distinct cross-user supporters. |
+| `D5_polarity_swapped` | Counterfactual control that swaps preferred and wrong edge roles. |
+| `D6_popularity_control` | Reorders score ties by training-item popularity without failure memory. |
+| `D7_shuffled_provenance` | Preserves evidence count/polarity but maps it to different candidates. |
+
+The default D pilot reuses existing memory files and runs evaluation only:
+
+```bash
+N_USERS=100 \
+MEMCF_EVAL_ROOT=/path/to/evaluation_results_memcf_d_typed_100u \
+MEMCF_MEMORY_ROOT=/path/to/agent_memory_memcf_1k_main \
+bash scripts/run_d_typed_constraints_6datasets_100u.sh
+```
+
+The primary comparisons are `D3/D4` versus `D0` for failure-memory gain,
+`D3/D4` versus `D1` for collaborative gain, and `D3/D4` versus `D5/D6/D7`
+for polarity, popularity, and provenance controls.
