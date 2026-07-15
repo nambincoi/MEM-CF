@@ -16,6 +16,14 @@ VARIANTS = [
     "G4_matched_random",
 ]
 
+MODE_TO_VARIANT = {
+    "g_same_only": "G0_same_only",
+    "g_true_neighbor": "G1_true_neighbor",
+    "g_shuffled_graph": "G2_shuffled_graph",
+    "g_random_neighbor": "G3_random_neighbor",
+    "g_matched_random": "G4_matched_random",
+}
+
 
 def read_jsonl(path: Path):
     if not path.exists():
@@ -33,6 +41,12 @@ def read_jsonl(path: Path):
 def variant_from_text(text: str):
     lowered = text.lower()
     return next((variant for variant in VARIANTS if variant.lower() in lowered), None)
+
+
+def variant_from_summary(summary: dict, summary_path: Path):
+    """Prefer explicit run metadata over potentially shortened filenames."""
+    mode = str(summary.get("failure_constraint_mode", "")).strip().lower()
+    return MODE_TO_VARIANT.get(mode) or variant_from_text(summary_path.name)
 
 
 def trace_dir(dataset_dir: Path, summary: dict, variant: str):
@@ -89,7 +103,11 @@ def main():
     for dataset_dir in sorted(path for path in root.iterdir() if path.is_dir() and not path.name.startswith("_")):
         latest_summaries = {}
         for summary_path in dataset_dir.glob("*.summary.json"):
-            variant = variant_from_text(summary_path.name)
+            try:
+                summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            variant = variant_from_summary(summary, summary_path)
             if not variant:
                 continue
             previous = latest_summaries.get(variant)
