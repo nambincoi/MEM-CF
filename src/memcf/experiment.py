@@ -3984,11 +3984,12 @@ class MemoryGraphIndex:
                     source: len(target_shuffled & shuffled_items.get(source, set()))
                     for source in candidate_memory_sources
                 }
+                # Rank all candidate-linked sources under the shuffled graph,
+                # including zero-overlap sources. Keeping exactly `desired`
+                # sources makes this a topology control rather than a lower-
+                # exposure treatment when edge swaps remove all local overlap.
                 chosen_sources = sorted(
-                    (
-                        source for source in candidate_memory_sources
-                        if shuffled_shared_by_source.get(source, 0) >= min_shared_items
-                    ),
+                    candidate_memory_sources,
                     key=lambda source: (
                         -shuffled_shared_by_source.get(source, 0),
                         source,
@@ -7830,10 +7831,13 @@ def main_v2():
             "baseline_metrics": baseline_metric,
         })
 
-    if use_memory:
-        output_file = os.path.join(eval_dir, f"{run_name}.json")
-    else:
-        output_file = os.path.join(eval_dir, f"{run_name}.json")
+    output_stem = run_name
+    # Keep room for both `.json` and `.summary.json` on filesystems with the
+    # usual 255-byte component limit. The full run name remains in the summary.
+    if len(output_stem.encode("utf-8")) > 220:
+        output_digest = hashlib.sha256(output_stem.encode("utf-8")).hexdigest()[:12]
+        output_stem = f"{output_stem[:190]}_{output_digest}"
+    output_file = os.path.join(eval_dir, f"{output_stem}.json")
     save_all_users_ranking_results(all_user_results, items_meta, output_file)
 
     print("\nValidation Results:")

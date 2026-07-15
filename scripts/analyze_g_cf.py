@@ -85,11 +85,17 @@ def main():
 
     rows = []
     per_user = {}
+    exposed_users = {}
     for dataset_dir in sorted(path for path in root.iterdir() if path.is_dir() and not path.name.startswith("_")):
+        latest_summaries = {}
         for summary_path in dataset_dir.glob("*.summary.json"):
             variant = variant_from_text(summary_path.name)
             if not variant:
                 continue
+            previous = latest_summaries.get(variant)
+            if previous is None or summary_path.stat().st_mtime > previous.stat().st_mtime:
+                latest_summaries[variant] = summary_path
+        for variant, summary_path in latest_summaries.items():
             summary = json.loads(summary_path.read_text(encoding="utf-8"))
             trace = trace_dir(dataset_dir, summary, variant)
             ranking_rows = read_jsonl(trace / "ranking_result.jsonl") if trace else []
@@ -102,7 +108,11 @@ def main():
 
             audits = [row.get("cf_control_audit") or {} for row in evidence_rows]
             exposed = [audit for audit in audits if int(audit.get("selected_evidence_rows", 0)) > 0]
-            equal_budget = [audit for audit in audits if audit.get("equal_budget_satisfied") is True]
+            eligible = [audit for audit in audits if int(audit.get("desired_sources", 0)) > 0]
+            equal_budget = [audit for audit in eligible if audit.get("equal_budget_satisfied") is True]
+            exposed_users[dataset_dir.name, variant] = {
+                str(audit.get("user_id")) for audit in exposed if audit.get("user_id") is not None
+            }
             jaccards = [
                 float(value)
                 for audit in audits
@@ -117,7 +127,9 @@ def main():
                 "cf_audited_users": len(audits),
                 "cf_exposed_users": len(exposed),
                 "cf_exposure_rate": len(exposed) / len(audits) if audits else 0.0,
-                "equal_budget_rate": len(equal_budget) / len(audits) if audits else 0.0,
+                "cf_eligible_users": len(eligible),
+                "cf_eligible_rate": len(eligible) / len(audits) if audits else 0.0,
+                "equal_budget_rate": len(equal_budget) / len(eligible) if eligible else 0.0,
                 "mean_selected_sources": mean([float(audit.get("selected_source_count", 0)) for audit in audits]),
                 "mean_selected_jaccard": mean(jaccards),
                 "trace_dir": str(trace) if trace else "",
@@ -136,10 +148,18 @@ def main():
             row[f"wins_vs_{key}"] = sum(delta > 1e-12 for delta in deltas)
             row[f"losses_vs_{key}"] = sum(delta < -1e-12 for delta in deltas)
 
+            g1_exposed = exposed_users.get((row["dataset"], "G1_true_neighbor"), set())
+            exposed_common = sorted(set(current) & set(baseline) & g1_exposed)
+            exposed_deltas = [current[user] - baseline[user] for user in exposed_common]
+            row[f"g1_exposed_delta_vs_{key}"] = mean(exposed_deltas)
+            row[f"g1_exposed_ci95_vs_{key}"] = bootstrap_ci(exposed_deltas)
+
     columns = [
-        "dataset", "variant", "users", "ndcg@10", "cf_exposure_rate",
+        "dataset", "variant", "users", "ndcg@10", "cf_eligible_rate", "cf_exposure_rate",
         "equal_budget_rate", "mean_selected_sources", "mean_selected_jaccard",
         "delta_vs_g0", "ci95_vs_g0", "delta_vs_g2", "delta_vs_g3", "delta_vs_g4",
+        "g1_exposed_delta_vs_g0", "g1_exposed_delta_vs_g2",
+        "g1_exposed_delta_vs_g3", "g1_exposed_delta_vs_g4",
     ]
     lines = [
         "| " + " | ".join(columns) + " |",
