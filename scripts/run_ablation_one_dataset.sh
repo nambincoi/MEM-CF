@@ -275,6 +275,21 @@ case "$VARIANT" in
   AF6_strong_same_plus_polarity)
     ARGS=("${COMMON_ARGS[@]}" "${MEMORY_ARGS[@]}" --graph_retrieval_scope same_user --failure_constraint_with_prompt_memory --failure_constraint_mode cf_polarity_swapped --failure_constraint_tie_epsilon "${FAILURE_CONSTRAINT_TIE_EPSILON:-0.0}" --failure_constraint_min_cross_support "${FAILURE_CONSTRAINT_MIN_CROSS_SUPPORT:-2}" --failure_constraint_min_shared_items "${FAILURE_CONSTRAINT_MIN_SHARED_ITEMS:-1}" --failure_constraint_max_cross_corrections "${FAILURE_CONSTRAINT_MAX_CROSS_CORRECTIONS:-3}" --failure_constraint_cross_budget "${FAILURE_CONSTRAINT_CROSS_BUDGET:-128}")
     ;;
+  G0_same_only)
+    ARGS=("${COMMON_ARGS[@]}" "${MEMORY_ARGS[@]}" --graph_retrieval_scope same_user)
+    ;;
+  G1_true_neighbor)
+    ARGS=("${COMMON_ARGS[@]}" "${MEMORY_ARGS[@]}" --graph_retrieval_scope same_user --failure_constraint_with_prompt_memory --failure_constraint_mode g_true_neighbor --failure_constraint_tie_epsilon "${FAILURE_CONSTRAINT_TIE_EPSILON:-0.0}" --failure_constraint_min_cross_support "${FAILURE_CONSTRAINT_MIN_CROSS_SUPPORT:-1}" --failure_constraint_min_shared_items "${FAILURE_CONSTRAINT_MIN_SHARED_ITEMS:-1}" --failure_constraint_max_cross_corrections "${FAILURE_CONSTRAINT_MAX_CROSS_CORRECTIONS:-2}" --failure_constraint_cross_budget "${FAILURE_CONSTRAINT_CROSS_BUDGET:-2}" --cf_source_budget "${CF_SOURCE_BUDGET:-2}" --cf_control_seed "${CF_CONTROL_SEED:-2027}")
+    ;;
+  G2_shuffled_graph)
+    ARGS=("${COMMON_ARGS[@]}" "${MEMORY_ARGS[@]}" --graph_retrieval_scope same_user --failure_constraint_with_prompt_memory --failure_constraint_mode g_shuffled_graph --failure_constraint_tie_epsilon "${FAILURE_CONSTRAINT_TIE_EPSILON:-0.0}" --failure_constraint_min_cross_support "${FAILURE_CONSTRAINT_MIN_CROSS_SUPPORT:-1}" --failure_constraint_min_shared_items "${FAILURE_CONSTRAINT_MIN_SHARED_ITEMS:-1}" --failure_constraint_max_cross_corrections "${FAILURE_CONSTRAINT_MAX_CROSS_CORRECTIONS:-2}" --failure_constraint_cross_budget "${FAILURE_CONSTRAINT_CROSS_BUDGET:-2}" --cf_source_budget "${CF_SOURCE_BUDGET:-2}" --cf_control_seed "${CF_CONTROL_SEED:-2027}")
+    ;;
+  G3_random_neighbor)
+    ARGS=("${COMMON_ARGS[@]}" "${MEMORY_ARGS[@]}" --graph_retrieval_scope same_user --failure_constraint_with_prompt_memory --failure_constraint_mode g_random_neighbor --failure_constraint_tie_epsilon "${FAILURE_CONSTRAINT_TIE_EPSILON:-0.0}" --failure_constraint_min_cross_support "${FAILURE_CONSTRAINT_MIN_CROSS_SUPPORT:-1}" --failure_constraint_min_shared_items "${FAILURE_CONSTRAINT_MIN_SHARED_ITEMS:-1}" --failure_constraint_max_cross_corrections "${FAILURE_CONSTRAINT_MAX_CROSS_CORRECTIONS:-2}" --failure_constraint_cross_budget "${FAILURE_CONSTRAINT_CROSS_BUDGET:-2}" --cf_source_budget "${CF_SOURCE_BUDGET:-2}" --cf_control_seed "${CF_CONTROL_SEED:-2027}")
+    ;;
+  G4_matched_random)
+    ARGS=("${COMMON_ARGS[@]}" "${MEMORY_ARGS[@]}" --graph_retrieval_scope same_user --failure_constraint_with_prompt_memory --failure_constraint_mode g_matched_random --failure_constraint_tie_epsilon "${FAILURE_CONSTRAINT_TIE_EPSILON:-0.0}" --failure_constraint_min_cross_support "${FAILURE_CONSTRAINT_MIN_CROSS_SUPPORT:-1}" --failure_constraint_min_shared_items "${FAILURE_CONSTRAINT_MIN_SHARED_ITEMS:-1}" --failure_constraint_max_cross_corrections "${FAILURE_CONSTRAINT_MAX_CROSS_CORRECTIONS:-2}" --failure_constraint_cross_budget "${FAILURE_CONSTRAINT_CROSS_BUDGET:-2}" --cf_source_budget "${CF_SOURCE_BUDGET:-2}" --cf_control_seed "${CF_CONTROL_SEED:-2027}")
+    ;;
   # Weak controls aligned with MemRec-style vanilla LLM.
   # These are additive variants; they do not change the main A0-A17 runs.
   B0_vanilla_llm)

@@ -3660,6 +3660,9 @@ class MemoryGraphIndex:
         self.memories_by_wrong_item: Dict[str, Set[str]] = defaultdict(set)
         self.memories_by_context_item: Dict[str, Set[str]] = defaultdict(set)
         self.lessons: Dict[str, FailureLesson] = {}
+        self.item_category_by_id: Dict[str, str] = {}
+        self._shuffled_items_cache: Dict[str, Dict[str, Set[str]]] = {}
+        self.last_cf_control_audit: Dict[str, Any] = {}
         self.cluster_by_user: Dict[str, int] = {}
         self.users_by_cluster: Dict[int, Set[str]] = defaultdict(set)
         for user_id, user_data in user_sequences.items():
@@ -3669,6 +3672,110 @@ class MemoryGraphIndex:
                 self.users_by_item[sid].add(str(user_id))
         if build_clusters:
             self._build_user_clusters()
+
+    def configure_item_metadata(self, items_meta: Dict[str, Dict[str, Any]]) -> None:
+        """Attach coarse item categories used only by matched CF controls."""
+        self.item_category_by_id = {
+            str(item_id): item_category(meta).lower()
+            for item_id, meta in (items_meta or {}).items()
+        }
+
+    def _user_category_profile(self, user_id: str) -> Counter:
+        return Counter(
+            self.item_category_by_id.get(item_id, "unknown")
+            for item_id in self.items_by_user.get(str(user_id), set())
+        )
+
+    @staticmethod
+    def _counter_l1(left: Counter, right: Counter) -> float:
+        keys = set(left) | set(right)
+        left_total = max(1, sum(left.values()))
+        right_total = max(1, sum(right.values()))
+        return sum(
+            abs(left.get(key, 0) / left_total - right.get(key, 0) / right_total)
+            for key in keys
+        )
+
+    def _degree_preserving_shuffled_items(self, seed: int) -> Dict[str, Set[str]]:
+        """Shuffle the memory-user interaction graph while preserving degrees.
+
+        Double-edge swaps preserve every included user degree and item degree.
+        The graph is cached once per process/seed and never uses held-out labels.
+        """
+        cache_key = str(int(seed))
+        if cache_key in self._shuffled_items_cache:
+            return self._shuffled_items_cache[cache_key]
+
+        active_users = sorted(
+            user_id for user_id, memory_ids in self.memories_by_user.items()
+            if memory_ids and self.items_by_user.get(user_id)
+        )
+        adjacency = {
+            user_id: set(self.items_by_user.get(user_id, set()))
+            for user_id in active_users
+        }
+        edges = [
+            (user_id, item_id)
+            for user_id in active_users
+            for item_id in sorted(adjacency[user_id])
+        ]
+        rng = random.Random(int(seed))
+        attempts = min(500000, max(1000, len(edges) * 5))
+        swaps = 0
+        for _ in range(attempts):
+            if len(edges) < 2:
+                break
+            left = rng.randrange(len(edges))
+            right = rng.randrange(len(edges))
+            if left == right:
+                continue
+            user_a, item_a = edges[left]
+            user_b, item_b = edges[right]
+            if user_a == user_b or item_a == item_b:
+                continue
+            if item_b in adjacency[user_a] or item_a in adjacency[user_b]:
+                continue
+            adjacency[user_a].remove(item_a)
+            adjacency[user_b].remove(item_b)
+            adjacency[user_a].add(item_b)
+            adjacency[user_b].add(item_a)
+            edges[left] = (user_a, item_b)
+            edges[right] = (user_b, item_a)
+            swaps += 1
+
+        self._shuffled_items_cache[cache_key] = adjacency
+        return adjacency
+
+    def _matched_random_sources(
+        self,
+        reference_sources: List[str],
+        candidate_pool: List[str],
+        budget: int,
+    ) -> Tuple[List[str], Dict[str, str]]:
+        """Match non-neighbors to true neighbors by activity and memory profile."""
+        available = set(str(x) for x in candidate_pool)
+        selected: List[str] = []
+        matched_to: Dict[str, str] = {}
+        for reference in reference_sources[:max(0, int(budget))]:
+            if not available:
+                break
+            ref_items = len(self.items_by_user.get(reference, set()))
+            ref_memories = len(self.memories_by_user.get(reference, set()))
+            ref_categories = self._user_category_profile(reference)
+
+            def distance(source: str) -> Tuple[float, str]:
+                source_items = len(self.items_by_user.get(source, set()))
+                source_memories = len(self.memories_by_user.get(source, set()))
+                activity = abs(source_items - ref_items) / max(1, source_items, ref_items)
+                memory_count = abs(source_memories - ref_memories) / max(1, source_memories, ref_memories)
+                category = self._counter_l1(ref_categories, self._user_category_profile(source))
+                return activity + memory_count + category, source
+
+            chosen = min(available, key=distance)
+            available.remove(chosen)
+            selected.append(chosen)
+            matched_to[chosen] = reference
+        return selected, matched_to
 
     def _target_cluster_count(self, users: Optional[int] = None) -> int:
         users = max(1, int(users if users is not None else len(self.items_by_user)))
@@ -3791,6 +3898,8 @@ class MemoryGraphIndex:
         max_cross_evidence: int = 128,
         shuffle_salt: str = "",
         min_shared_items: int = 1,
+        cf_source_budget: int = 2,
+        cf_control_seed: int = 2027,
     ) -> List[Dict[str, Any]]:
         """Return exact, role-preserving evidence for D-family constraints.
 
@@ -3813,6 +3922,8 @@ class MemoryGraphIndex:
             "polarity_swapped", "shuffled_provenance",
             "cf_shared_cross", "cf_same_plus_shared", "cf_shuffled_neighbors",
             "cf_random_neighbors", "cf_polarity_swapped",
+            "g_true_neighbor", "g_shuffled_graph", "g_random_neighbor",
+            "g_matched_random",
         }
         if not include_same and not include_cross:
             raise ValueError(f"Unsupported failure_constraint_mode={mode}")
@@ -3835,6 +3946,97 @@ class MemoryGraphIndex:
             if shared >= min_shared_items
         }
         eligible_cf_sources = set(true_cf_sources)
+        source_rank: Dict[str, int] = {}
+        matched_to: Dict[str, str] = {}
+        shuffled_shared_by_source: Dict[str, int] = {}
+
+        candidate_memory_sources: Set[str] = set()
+        for candidate_id in candidate_ids:
+            for memory_id in (
+                set(self.memories_by_correct_item.get(str(candidate_id), set()))
+                | set(self.memories_by_wrong_item.get(str(candidate_id), set()))
+            ):
+                lesson = self.lessons.get(memory_id)
+                if lesson and str(lesson.source_user_id) != user_id:
+                    candidate_memory_sources.add(str(lesson.source_user_id))
+
+        g_modes = {
+            "g_true_neighbor", "g_shuffled_graph", "g_random_neighbor",
+            "g_matched_random",
+        }
+        if mode in g_modes:
+            budget = max(1, int(cf_source_budget))
+            true_ranked = sorted(
+                (source for source in candidate_memory_sources if source in true_cf_sources),
+                key=lambda source: (
+                    -shared_by_source.get(source, 0),
+                    -self._user_jaccard(user_id, source),
+                    source,
+                ),
+            )
+            desired = min(budget, len(true_ranked))
+            if mode == "g_true_neighbor":
+                chosen_sources = true_ranked[:desired]
+            elif mode == "g_shuffled_graph":
+                shuffled_items = self._degree_preserving_shuffled_items(cf_control_seed)
+                target_shuffled = shuffled_items.get(user_id, target_items)
+                shuffled_shared_by_source = {
+                    source: len(target_shuffled & shuffled_items.get(source, set()))
+                    for source in candidate_memory_sources
+                }
+                chosen_sources = sorted(
+                    (
+                        source for source in candidate_memory_sources
+                        if shuffled_shared_by_source.get(source, 0) >= min_shared_items
+                    ),
+                    key=lambda source: (
+                        -shuffled_shared_by_source.get(source, 0),
+                        source,
+                    ),
+                )[:desired]
+            else:
+                nonneighbors = sorted(candidate_memory_sources - true_cf_sources)
+                if mode == "g_random_neighbor":
+                    chosen_sources = deterministic_shuffle(
+                        nonneighbors,
+                        salt=f"g_random::{cf_control_seed}::{user_id}::{shuffle_salt}",
+                    )[:desired]
+                else:
+                    chosen_sources, matched_to = self._matched_random_sources(
+                        reference_sources=true_ranked,
+                        candidate_pool=nonneighbors,
+                        budget=desired,
+                    )
+            eligible_cf_sources = set(chosen_sources)
+            source_rank = {source: rank for rank, source in enumerate(chosen_sources, 1)}
+            self.last_cf_control_audit = {
+                "mode": mode,
+                "user_id": user_id,
+                "source_budget": budget,
+                "desired_sources": desired,
+                "candidate_memory_sources": len(candidate_memory_sources),
+                "true_neighbor_sources": len(true_ranked),
+                "selected_sources": chosen_sources,
+                "selected_source_count": len(chosen_sources),
+                "selected_real_shared_items": {
+                    source: shared_by_source.get(source, 0) for source in chosen_sources
+                },
+                "selected_shuffled_shared_items": {
+                    source: shuffled_shared_by_source.get(source, 0) for source in chosen_sources
+                },
+                "selected_jaccard": {
+                    source: self._user_jaccard(user_id, source) for source in chosen_sources
+                },
+                "matched_to_true_source": matched_to,
+                "control_seed": int(cf_control_seed),
+                "degree_preserving_shuffle": mode == "g_shuffled_graph",
+            }
+        else:
+            self.last_cf_control_audit = {
+                "mode": mode,
+                "user_id": user_id,
+                "true_neighbor_sources": len(true_cf_sources),
+            }
         if mode in {"cf_shuffled_neighbors", "cf_random_neighbors"}:
             non_neighbors = [u for u in memory_users if u not in true_cf_sources]
             pool = non_neighbors if non_neighbors else memory_users
@@ -3847,6 +4049,8 @@ class MemoryGraphIndex:
         f_modes = {
             "cf_shared_cross", "cf_same_plus_shared", "cf_shuffled_neighbors",
             "cf_random_neighbors", "cf_polarity_swapped",
+            "g_true_neighbor", "g_shuffled_graph", "g_random_neighbor",
+            "g_matched_random",
         }
         neighbor_shared = dict(self.similar_users(user_id, top_k=max(10, max_cross_evidence)))
         rows: List[Dict[str, Any]] = []
@@ -3901,6 +4105,11 @@ class MemoryGraphIndex:
                         "cf_source_is_true_neighbor": source_user_id in true_cf_sources,
                         "cf_source_is_eligible": source_user_id in eligible_cf_sources,
                         "cf_min_shared_items": min_shared_items,
+                        "cf_control_mode": mode if mode in g_modes else "",
+                        "cf_source_rank": source_rank.get(source_user_id, 0),
+                        "cf_source_jaccard": self._user_jaccard(user_id, source_user_id),
+                        "cf_shuffled_shared_items": shuffled_shared_by_source.get(source_user_id, 0),
+                        "cf_matched_to_true_source": matched_to.get(source_user_id, ""),
                         "matched_user_terms": matched_terms[:12],
                         "confidence": _safe_float(lesson.confidence, 0.5),
                         "overgeneralization_risk": _safe_float(lesson.overgeneralization_risk, 0.5),
@@ -3927,11 +4136,28 @@ class MemoryGraphIndex:
         )
         same_rows.sort(key=row_key)
         cross_rows.sort(key=row_key)
+        if mode in g_modes:
+            # One candidate-linked failure edge per source makes cross-memory
+            # count directly comparable across true and control treatments.
+            one_per_source: List[Dict[str, Any]] = []
+            seen_sources: Set[str] = set()
+            for row in cross_rows:
+                source = str(row["source_user_id"])
+                if source in seen_sources:
+                    continue
+                seen_sources.add(source)
+                one_per_source.append(row)
+            cross_rows = one_per_source
         if max_same_evidence > 0:
             same_rows = same_rows[:max_same_evidence]
         if max_cross_evidence > 0:
             cross_rows = cross_rows[:max_cross_evidence]
         selected = same_rows + cross_rows
+        if mode in g_modes:
+            self.last_cf_control_audit["selected_evidence_rows"] = len(cross_rows)
+            self.last_cf_control_audit["equal_budget_satisfied"] = (
+                len(cross_rows) == int(self.last_cf_control_audit.get("desired_sources", 0))
+            )
 
         if mode == "shuffled_provenance" and selected and len(candidate_ids) > 1:
             # Rotate evidence targets by a deterministic non-zero offset. This
@@ -5760,6 +5986,10 @@ FAILURE_CONSTRAINT_MODES = {
     "cf_shuffled_neighbors",
     "cf_random_neighbors",
     "cf_polarity_swapped",
+    "g_true_neighbor",
+    "g_shuffled_graph",
+    "g_random_neighbor",
+    "g_matched_random",
 }
 
 
@@ -5813,6 +6043,8 @@ def aggregate_typed_failure_constraints(
         if mode in {
             "full_consensus", "cf_shared_cross", "cf_same_plus_shared",
             "cf_shuffled_neighbors", "cf_random_neighbors", "cf_polarity_swapped",
+            "g_true_neighbor", "g_shuffled_graph", "g_random_neighbor",
+            "g_matched_random",
         }:
             # Strict source-user consensus: repeated lessons from one prolific
             # user count once; any polarity conflict disables cross-user action.
@@ -5883,7 +6115,7 @@ def apply_typed_failure_constraints(
         candidate_popularity=candidate_popularity,
     )
 
-    if mode.startswith("cf_") and max_cross_corrections > 0:
+    if (mode.startswith("cf_") or mode.startswith("g_")) and max_cross_corrections > 0:
         cross_candidates = sorted(
             (
                 (item_id, signal) for item_id, signal in signals.items()
@@ -6790,6 +7022,8 @@ def evaluate_user_v2(
     failure_constraint_cross_budget: int = 128,
     failure_constraint_min_shared_items: int = 1,
     failure_constraint_max_cross_corrections: int = 3,
+    cf_source_budget: int = 2,
+    cf_control_seed: int = 2027,
     ranking_score_cache_dir: Optional[str] = None,
     failure_constraint_with_prompt_memory: bool = False,
 ) -> Tuple[Dict[str, float], Dict[str, float], List[str], List[str], List[str]]:
@@ -6838,6 +7072,8 @@ def evaluate_user_v2(
                 max_cross_evidence=failure_constraint_cross_budget,
                 shuffle_salt=f"{eval_type}:{user_id}:{','.join(candidates)}",
                 min_shared_items=failure_constraint_min_shared_items,
+                cf_source_budget=cf_source_budget,
+                cf_control_seed=cf_control_seed,
             )
             memory_system.record_memory_diagnostics(
                 retrieved=len(failure_constraint_evidence),
@@ -6851,6 +7087,7 @@ def evaluate_user_v2(
                 "candidate_item_ids": candidates,
                 "recent_history_ids": train_history_for_prompt,
                 "evidence": failure_constraint_evidence,
+                "cf_control_audit": dict(graph.last_cf_control_audit),
             })
             memory_reader_result = {
                 "use_memory": bool(failure_constraint_evidence) or failure_constraint_mode == "popularity",
@@ -7193,6 +7430,10 @@ def parse_args_v2():
                         help="Minimum shared training items for an F-family collaborative source user.")
     parser.add_argument("--failure_constraint_max_cross_corrections", type=int, default=3,
                         help="Maximum cross-user candidate corrections per query in F-family modes.")
+    parser.add_argument("--cf_source_budget", type=int, default=2,
+                        help="Cross-user source count used by matched-budget G-family controls.")
+    parser.add_argument("--cf_control_seed", type=int, default=2027,
+                        help="Deterministic graph-shuffle/random-control seed for G-family controls.")
     parser.add_argument("--ranking_score_cache_dir", type=str, default=None,
                         help="Optional cache for clean LLM score responses shared by eval-only ablations.")
     parser.add_argument("--failure_constraint_with_prompt_memory", action="store_true", default=False,
@@ -7234,6 +7475,8 @@ def parse_args_v2():
         raise ValueError("--failure_constraint_min_cross_support must be >= 1")
     if args.failure_constraint_min_shared_items < 1:
         raise ValueError("--failure_constraint_min_shared_items must be >= 1")
+    if args.cf_source_budget < 1:
+        raise ValueError("--cf_source_budget must be >= 1")
     if args.failure_constraint_max_cross_corrections < 1:
         raise ValueError("--failure_constraint_max_cross_corrections must be >= 1")
 
@@ -7380,6 +7623,10 @@ def main_v2():
             "cf_shuffled_neighbors": "f4shuf",
             "cf_random_neighbors": "f5rand",
             "cf_polarity_swapped": "f6swap",
+            "g_true_neighbor": "g1true",
+            "g_shuffled_graph": "g2shufgraph",
+            "g_random_neighbor": "g3random",
+            "g_matched_random": "g4matched",
         }
         failure_constraint_tag = (
             f"_{mode_tags[args.failure_constraint_mode]}"
@@ -7388,6 +7635,8 @@ def main_v2():
             f"_si{args.failure_constraint_min_shared_items}"
             f"_mc{args.failure_constraint_max_cross_corrections}"
         )
+        if args.failure_constraint_mode.startswith("g_"):
+            failure_constraint_tag += f"_sb{args.cf_source_budget}_seed{args.cf_control_seed}"
     shard_tag = f"shard{args.user_shard_id}of{args.num_user_shards}" if args.num_user_shards > 1 else "fullusers"
     suffix_tag = f"_{slugify(args.run_name_suffix)}" if args.run_name_suffix else ""
     run_name = (
@@ -7507,6 +7756,10 @@ def main_v2():
     else:
         print("MEMCF no-memory run: skipping user-memory init and failure-memory training.")
 
+    # Matching controls use only coarse train-item category distributions.
+    # This metadata is query-independent and never includes held-out labels.
+    graph.configure_item_metadata(items_meta)
+
     print("\n" + "=" * 80)
     print(f"PHASE 2: {args.eval_split.upper()} SET EVALUATION")
     print("=" * 80)
@@ -7559,6 +7812,8 @@ def main_v2():
             failure_constraint_cross_budget=args.failure_constraint_cross_budget,
             failure_constraint_min_shared_items=args.failure_constraint_min_shared_items,
             failure_constraint_max_cross_corrections=args.failure_constraint_max_cross_corrections,
+            cf_source_budget=args.cf_source_budget,
+            cf_control_seed=args.cf_control_seed,
             ranking_score_cache_dir=args.ranking_score_cache_dir,
             failure_constraint_with_prompt_memory=args.failure_constraint_with_prompt_memory,
         )
@@ -7640,6 +7895,8 @@ def main_v2():
         "failure_constraint_cross_budget": args.failure_constraint_cross_budget,
         "failure_constraint_min_shared_items": args.failure_constraint_min_shared_items,
         "failure_constraint_max_cross_corrections": args.failure_constraint_max_cross_corrections,
+        "cf_source_budget": args.cf_source_budget,
+        "cf_control_seed": args.cf_control_seed,
         "ranking_score_cache_dir": args.ranking_score_cache_dir,
         "failure_constraint_with_prompt_memory": args.failure_constraint_with_prompt_memory,
         "artifact_root": artifact_root,
